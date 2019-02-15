@@ -1,5 +1,15 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"fmt"
+	// "io"
+	// "io/ioutil"
+	"log"
+	"os"
+	"sort"
+)
+
 func doReduce(
 	jobName string, // the name of the whole MapReduce job
 	reduceTask int, // which reduce task this is
@@ -44,4 +54,86 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
+
+	fmt.Printf("===============================\n")
+	fmt.Printf("- reduceTask:%v\n", reduceTask)
+	fmt.Printf("- nMap:%v\n", nMap)
+	fmt.Printf("- outFile:%v\n", outFile)
+
+	// Open M files, combine and sort them base on key
+	fos := [](*os.File){}
+	var kvs []KeyValue
+	var kv KeyValue
+	for m := 0; m < nMap; m++ {
+		f, err := os.Open(fmt.Sprintf("mrtmp.%v-%v-%v", jobName, m, reduceTask))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fos = append(fos, f)
+
+		dec := json.NewDecoder(fos[m])
+		for dec.More() {
+			err = dec.Decode(&kv)
+			if err != nil {
+				log.Fatal(err)
+			}
+			kvs = append(kvs, kv)
+		}
+	}
+
+	// sort them base on key
+	sort.Sort(&KeyValueSorter{
+		keyValues: kvs,
+	})
+
+	// open output file and write them after reducer
+	f, err := os.Create(outFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	enc := json.NewEncoder(f)
+
+	ss := []string{}
+	for i, kv := range kvs {
+		ss = append(ss, kv.Value)
+		if (i+1) == len(kvs) || kvs[i].Key != kvs[i+1].Key {
+			enc.Encode(KeyValue{kv.Key, reduceF(kv.Key, ss)})
+			ss = nil
+		}
+	}
+	// close the output file
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// close M input file per R at the end
+	defer func() {
+		for _, f := range fos {
+			err := f.Close()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}()
+	fmt.Printf("===============================\n")
+}
+
+// helper for sorting KeyValue type base on key value
+type KeyValueSorter struct {
+	keyValues []KeyValue
+}
+
+func (ks *KeyValueSorter) Len() int {
+	return len(ks.keyValues)
+}
+
+func (ks *KeyValueSorter) Less(i, j int) bool {
+	return ks.keyValues[i].Key < ks.keyValues[j].Key
+}
+
+func (ks *KeyValueSorter) Swap(i, j int) {
+	ks.keyValues[i], ks.keyValues[j] = ks.keyValues[j], ks.keyValues[i]
 }

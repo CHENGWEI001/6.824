@@ -144,6 +144,7 @@ func cleanup(mr *Master) {
 }
 
 func TestSequentialSingle(t *testing.T) {
+	fmt.Println("running TestSequentialSingle")
 	mr := Sequential("test", makeInputs(1), 1, MapFunc, ReduceFunc)
 	mr.Wait()
 	check(t, mr.files)
@@ -152,6 +153,7 @@ func TestSequentialSingle(t *testing.T) {
 }
 
 func TestSequentialMany(t *testing.T) {
+	fmt.Println("running TestSequentialMany")
 	mr := Sequential("test", makeInputs(5), 3, MapFunc, ReduceFunc)
 	mr.Wait()
 	check(t, mr.files)

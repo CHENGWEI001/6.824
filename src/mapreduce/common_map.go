@@ -1,7 +1,13 @@
 package mapreduce
 
 import (
+	"encoding/json"
+	"fmt"
 	"hash/fnv"
+	// "io"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +59,52 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+
+	fmt.Printf("===============================\n")
+	fmt.Printf("- mapTask:%v\n", mapTask)
+	fmt.Printf("- nReduce:%v\n", nReduce)
+
+	// read input file
+	content, err := ioutil.ReadFile(inFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	kvs := mapF(inFile, string(content))
+
+	// open R output file and R encoder handler per M
+	fos := [](*os.File){}
+	ens := [](*json.Encoder){}
+	for r := 0; r < nReduce; r++ {
+		f, err := os.Create(fmt.Sprintf("mrtmp.%v-%v-%v", jobName, mapTask, r))
+		if err != nil {
+			log.Fatal(err)
+		}
+		fos = append(fos, f)
+
+		enc := json.NewEncoder(fos[r])
+		ens = append(ens, enc)
+
+	}
+
+	//https: //github.com/golang/go/blob/master/src/os/file.go for File.Write implementation
+	for _, kv := range kvs {
+		err := ens[ihash(kv.Key)%nReduce].Encode(&kv)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	// close R output file per M at the end
+	defer func() {
+		for _, f := range fos {
+			err := f.Close()
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}()
+	fmt.Printf("===============================\n")
 }
 
 func ihash(s string) int {
