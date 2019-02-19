@@ -1,4 +1,5 @@
 # mapreduce
+https://pdos.csail.mit.edu/6.824/labs/lab-1.html
 ## basic steps:
 ```
 $ cd 6.824
@@ -21,3 +22,6 @@ ok  	mapreduce	2.694s
 * https://golang.org/pkg/encoding/json/#NewEncoder
 * https://golang.org/src/encoding/json/example_test.go
 * https://golang.org/pkg/sort/#Sort
+* https://www.calhoun.io/concatenating-and-building-strings-in-go/
+* https://stackoverflow.com/questions/48978414/golang-strings-builder-type-undefined
+* https://yourbasic.org/golang/convert-string-to-rune-slice/

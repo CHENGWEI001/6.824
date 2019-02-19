@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"mapreduce"
 	"os"
+	"strconv"
+	"unicode"
 )
 
 //
@@ -15,6 +19,29 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+
+	kvs := []mapreduce.KeyValue{}
+	// convert contents to rune slice
+	r := []rune(contents)
+	buf := bytes.NewBuffer([]byte{})
+	lr := len(r)
+	for i := 0; i <= lr; i++ {
+		if i == lr || !unicode.IsLetter(r[i]) {
+			if buf.Len() != 0 {
+				kvs = append(kvs, mapreduce.KeyValue{
+					Key:   buf.String(),
+					Value: "",
+				})
+				buf.Reset()
+			}
+			continue
+		}
+		n, err := buf.WriteRune(r[i])
+		if n != 1 || err != nil {
+			log.Fatal("n: %v , err: %v!!", n)
+		}
+	}
+	return kvs
 }
 
 //
@@ -24,6 +51,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+	return strconv.Itoa(len(values))
 }
 
 // Can be run in 3 ways:
