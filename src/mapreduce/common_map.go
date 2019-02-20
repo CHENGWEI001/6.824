@@ -61,6 +61,7 @@ func doMap(
 	//
 
 	fmt.Printf("===============================\n")
+	fmt.Printf("doMap():\n")
 	fmt.Printf("- mapTask:%v\n", mapTask)
 	fmt.Printf("- nReduce:%v\n", nReduce)
 

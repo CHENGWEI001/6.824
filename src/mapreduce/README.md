@@ -17,6 +17,7 @@ ok  	mapreduce	2.694s
 ```
 
 ## Reference
+* https://github.com/sunhay/mit-6.824-2017
 * https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-file-using-go
 * https://golang.org/pkg/os/#Create
 * https://golang.org/pkg/encoding/json/#NewEncoder
@@ -25,3 +26,5 @@ ok  	mapreduce	2.694s
 * https://www.calhoun.io/concatenating-and-building-strings-in-go/
 * https://stackoverflow.com/questions/48978414/golang-strings-builder-type-undefined
 * https://yourbasic.org/golang/convert-string-to-rune-slice/
+* https://golang.org/pkg/net/rpc/#Client.Call
+* https://golang.org/pkg/sync/#WaitGroup

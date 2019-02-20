@@ -56,6 +56,7 @@ func doReduce(
 	//
 
 	fmt.Printf("===============================\n")
+	fmt.Printf("doReduce():\n")
 	fmt.Printf("- reduceTask:%v\n", reduceTask)
 	fmt.Printf("- nMap:%v\n", nMap)
 	fmt.Printf("- outFile:%v\n", outFile)
