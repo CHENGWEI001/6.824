@@ -83,7 +83,7 @@ func doReduce(
 	}
 
 	// sort them base on key
-	sort.Sort(&KeyValueSorter{
+	sort.Stable(&KeyValueSorter{
 		keyValues: kvs,
 	})
 

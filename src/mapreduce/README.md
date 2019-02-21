@@ -11,10 +11,7 @@ ok  	mapreduce	2.694s
 
 ## note
 *  doMap save intermediate file into format M_R.json (ex: jobname is xxx, Map task idx = 0 , Reduce task idx = 0, the intermediate file name is mrtmp.xxx-0-0)
-* doReduce
-```
-- open
-```
+
 
 ## Reference
 * https://github.com/sunhay/mit-6.824-2017
@@ -28,3 +25,23 @@ ok  	mapreduce	2.694s
 * https://yourbasic.org/golang/convert-string-to-rune-slice/
 * https://golang.org/pkg/net/rpc/#Client.Call
 * https://golang.org/pkg/sync/#WaitGroup
+
+# Final test result
+```
+ec2-user:~/environment/6.824/src/main (master) $ bash ./test-mr.sh
+
+==> Part I
+ok      mapreduce       2.448s
+
+==> Part II
+Passed test
+
+==> Part III
+ok      mapreduce       3.179s
+
+==> Part IV
+ok      mapreduce       3.527s
+
+==> Part V (inverted index)
+Passed test
+```
