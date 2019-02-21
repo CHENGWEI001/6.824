@@ -3,8 +3,15 @@ package mapreduce
 import (
 	"fmt"
 	"log"
-	"sync"
+	// "sync"
 )
+
+// below are type I define to help on task scheduling
+type workerStatus_t struct {
+	arg  *DoTaskArgs
+	succ bool
+	wk   string
+}
 
 //
 // schedule() starts and waits for all tasks in the given phase (mapPhase
@@ -35,40 +42,60 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 
-	// below code are coming from : https://github.com/sunhay/mit-6.824-2017/blob/b75b5405935e78bfce4475111c8a1a10eb9cd262/mapreduce/schedule.go
-	var waitGroup sync.WaitGroup
-
-	// Ready worker channel. Buffer size = number of tasks
-	readyChan := make(chan string, ntasks)
-
-	// Helper to start task
-	startTask := func(worker string, args *DoTaskArgs) {
-		defer waitGroup.Done()
-		result := call(worker, "Worker.DoTask", args, nil)
-		readyChan <- worker
-		log.Printf("[%s, %s Scheduler] Task %d finished with result %t\n", jobName, phase, args.TaskNumber, result)
+	// init variable for task scheduling:
+	// 1) statusChan: status report from worker thread
+	// 2) taskQ: taskQ is managed by master only
+	// 3) startTask function literal
+	// 4) completedTaskNum
+	statusChan := make(chan workerStatus_t)
+	taskQ := []*DoTaskArgs{}
+	for i := 0; i < ntasks; i++ {
+		file := ""
+		if phase == mapPhase {
+			file = mapFiles[i]
+		}
+		taskQ = append(taskQ, &DoTaskArgs{
+			JobName:       jobName,
+			File:          file,
+			Phase:         phase,
+			TaskNumber:    i,
+			NumOtherPhase: n_other,
+		})
 	}
+	startTask := func(arg *DoTaskArgs, wk string, statusChan chan workerStatus_t) {
+		success := call(wk, "Worker.DoTask", arg, nil)
+		log.Printf("[%s, %s Scheduler] Task %d finished with result %t\n", jobName, phase, arg.TaskNumber, success)
+		statusChan <- workerStatus_t{
+			arg:  arg,
+			succ: success,
+			wk:   wk,
+		}
+	}
+	completedTaskNum := 0
 
-	// Assign tasks to registered + available workers
-	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
-	for currentTask := 0; currentTask < ntasks; {
+	// for loop until all task complete
+	// - the idea is to check if all task completed.
+	// - note if the worker fail (report fail status), then we should not give
+	//   this fail worker anymore task
+	for completedTaskNum < ntasks {
+		wk := ""
 		select {
-		case worker := <-registerChan: // New worker registering, set them as available
-			readyChan <- worker
-		case worker := <-readyChan: // Worker is ready to start another task
-			args := DoTaskArgs{
-				JobName:       jobName,
-				File:          mapFiles[currentTask], // Ignored for reduce phase
-				Phase:         phase,
-				TaskNumber:    currentTask,
-				NumOtherPhase: n_other,
+		case wk = <-registerChan:
+		case st := <-statusChan:
+			if !st.succ {
+				taskQ = append(taskQ, st.arg)
+			} else {
+				completedTaskNum++
+				wk = st.wk
 			}
-			waitGroup.Add(1)
-			currentTask++
-			go startTask(worker, &args)
+		}
+		// only schedule task if we have valid worker and pending task
+		if wk != "" && len(taskQ) > 0 {
+			var t *DoTaskArgs
+			t, taskQ = taskQ[0], taskQ[1:]
+			go startTask(t, wk, statusChan)
 		}
 	}
 
-	waitGroup.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
 }
