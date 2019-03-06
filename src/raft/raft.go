@@ -19,11 +19,13 @@ package raft
 
 import "sync"
 import "labrpc"
+import "time"
+import "math/rand"
+import "fmt"
+import "log"
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -45,6 +47,9 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+
+const INITIAL_VOTED_FOR = -1
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -55,7 +60,23 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm            int                      // current term of raft instance
+	votedFor               int                      // previous vote for who, initial to -1
+	currentRaftState       raftState                // current raft state
+	RequestVoteArgsChan    chan *RequestVoteArgs    // channel for receiving Request Vote
+	RequestVoteReplyChan   chan *RequestVoteReply   // channel for response Request Vote
+	AppendEntriesArgsChan  chan *AppendEntriesArgs  // channel for receiving Append Entry
+	AppendEntriesReplyChan chan *AppendEntriesReply // channel for response Append Entry
 }
+
+// serverState indicating current raft instance state
+type raftState string
+
+const (
+	follower  raftState = "follower"
+	candidate           = "candidate"
+	leader              = "leader"
+)
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -64,9 +85,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isleader = rf.currentRaftState == leader
+	term = rf.currentTerm
+
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -83,7 +108,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -107,15 +131,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	Term        int // candidate's term
+	CandidateId int // Id who send this request
+
 }
 
 //
@@ -124,6 +149,21 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+
+	Term        int  // currentTerm of the raft instance to response to candidate
+	VoteGranted bool // true if the raft instance agree to vote the candidate
+	FromId      int  // indicating this reply is from which raft instance
+}
+
+type AppendEntriesArgs struct {
+	Term   int // leader's term
+	LeadId int // leader Id
+}
+
+type AppendEntriesReply struct {
+	Term    int  // current term , for leader to update itself
+	Success bool // [ToDo]
+	FromId  int  // indicating this reply is from which raft instance
 }
 
 //
@@ -131,6 +171,16 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	log.Printf("[RequestVote][%v -> %v]: %+v\n", args.CandidateId, rf.me, *args)
+	rf.RequestVoteArgsChan <- args
+	*reply = *(<-rf.RequestVoteReplyChan)
+	log.Printf("[RequestVote][%v <- %v]: %+v\n", args.CandidateId, reply.FromId, *reply)
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.AppendEntriesArgsChan <- args
+	*reply = *(<-rf.AppendEntriesReplyChan)
 }
 
 //
@@ -167,6 +217,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +243,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
@@ -201,6 +254,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+func (rf *Raft) updateTerm(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = term
+}
+
+func (rf *Raft) updateState(state raftState) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentRaftState = state
 }
 
 //
@@ -220,12 +285,280 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
 	// Your initialization code here (2A, 2B, 2C).
+
+	rf.votedFor = INITIAL_VOTED_FOR
+	rf.currentTerm = 0
+	rf.currentRaftState = follower
+	rf.RequestVoteArgsChan = make(chan *RequestVoteArgs)
+	rf.RequestVoteReplyChan = make(chan *RequestVoteReply)
+	rf.AppendEntriesArgsChan = make(chan *AppendEntriesArgs)
+	rf.AppendEntriesReplyChan = make(chan *AppendEntriesReply)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go startRaftThread(rf)
 
 	return rf
+}
+
+// start point of raft thread, each raft instance is one thread, and it would
+// go into different handler base on current state
+func startRaftThread(rf *Raft) {
+	for {
+		switch state := rf.currentRaftState; state {
+		case follower:
+			followerHandler(rf)
+		case candidate:
+			candidateHandler(rf)
+		case leader:
+			leaderHandler(rf)
+		default:
+			panic(fmt.Sprintf("unexpected raft state: %v", state))
+		}
+	}
+}
+
+const ELECTION_TIMEOUT_MILISECONDS = 500
+const ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS = 500
+const HEARTBEAT_TIMEOUT_MILISECONDS = 200
+
+func getRandElectionTimeoutMiliSecond() time.Duration {
+	return time.Duration(rand.Intn(ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS)+ELECTION_TIMEOUT_MILISECONDS) * time.Millisecond
+	// return ELECTION_TIMEOUT_MILISECONDS * time.Millisecond
+}
+
+func followerHandler(rf *Raft) {
+	// - handle timeout, then start new election and change to candidate
+	// - handle AppendEntries ( heartbeat only for 2A)
+	// - handle RequestVote
+	rf.printInfo()
+	timer := time.After(getRandElectionTimeoutMiliSecond())
+	for {
+		select {
+		case <-timer:
+			rf.currentRaftState = candidate
+			return
+		case reqVote := <-rf.RequestVoteArgsChan:
+			rspVote := RequestVoteReply{
+				Term:        rf.currentTerm,
+				VoteGranted: false,
+				FromId:      rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqVote.Term > rf.currentTerm {
+				rf.currentTerm = reqVote.Term
+				rf.votedFor = reqVote.CandidateId
+			}
+			// per Fig2 Request RPC rule, only this condition to grant vote
+			if reqVote.Term >= rf.currentTerm &&
+				(rf.votedFor == INITIAL_VOTED_FOR || rf.votedFor == reqVote.CandidateId) {
+				rspVote.VoteGranted = true
+				rf.votedFor = reqVote.CandidateId
+			}
+			rspVote.Term = rf.currentTerm
+			rf.RequestVoteReplyChan <- &rspVote
+			// if grant vote for a leader, reset timer
+			if rspVote.VoteGranted {
+				return
+			}
+		case reqAppend := <-rf.AppendEntriesArgsChan:
+			rspAppend := AppendEntriesReply{
+				Term:    rf.currentTerm,
+				Success: false,
+				FromId:  rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqAppend.Term > rf.currentTerm {
+				rf.currentTerm = reqAppend.Term
+				rf.votedFor = reqAppend.LeadId
+			}
+
+			if reqAppend.Term >= rf.currentTerm && reqAppend.LeadId == rf.votedFor {
+				rspAppend.Success = true
+			}
+			rspAppend.Term = rf.currentTerm
+			rf.AppendEntriesReplyChan <- &rspAppend
+			// if ack an Append RPC, reset timer
+			if rspAppend.Success {
+				return
+			}
+		}
+	}
+}
+
+func candidateHandler(rf *Raft) {
+	// - every time go into it, meaning new election ,so increase its term
+	// - send the vote out to all peers
+	// - handle timeout, then start new election and still in candidate state
+	// - handle AppendEntries,
+	// - handle RequestVote
+	rf.printInfo()
+	rf.currentTerm += 1
+	timer := time.After(getRandElectionTimeoutMiliSecond())
+	voteReplyChan := make(chan *RequestVoteReply)
+	// vote for itself and send vote to followers
+	rf.votedFor = rf.me
+	voteCount := 1
+	sendVoteTask := func(term int, me int, destServer int, voteReplyChan chan *RequestVoteReply) {
+		argvs := RequestVoteArgs{
+			Term:        term,
+			CandidateId: me,
+		}
+		reply := RequestVoteReply{}
+		if rf.sendRequestVote(destServer, &argvs, &reply) {
+			voteReplyChan <- &reply
+		}
+	}
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go sendVoteTask(rf.currentTerm, rf.me, i, voteReplyChan)
+	}
+
+	for {
+		select {
+		case <-timer:
+			return
+		case reqVote := <-rf.RequestVoteArgsChan:
+			rspVote := RequestVoteReply{
+				Term:        rf.currentTerm,
+				VoteGranted: false,
+				FromId:      rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqVote.Term > rf.currentTerm {
+				rf.currentTerm = reqVote.Term
+				rf.currentRaftState = follower
+				rf.votedFor = reqVote.CandidateId
+				rspVote.VoteGranted = true
+			}
+			rspVote.Term = rf.currentTerm
+			rf.RequestVoteReplyChan <- &rspVote
+			// if granted, reset timer and step down as follower
+			if rspVote.VoteGranted {
+				return
+			}
+		case reqAppend := <-rf.AppendEntriesArgsChan:
+			rspAppend := AppendEntriesReply{
+				Term:    rf.currentTerm,
+				Success: false,
+				FromId:  rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqAppend.Term > rf.currentTerm {
+				rf.currentTerm = reqAppend.Term
+				rf.currentRaftState = follower
+				rf.votedFor = reqAppend.LeadId
+				rspAppend.Success = true
+			}
+			rspAppend.Term = rf.currentTerm
+			rf.AppendEntriesReplyChan <- &rspAppend
+			// if ack an Append RPC, return to follower state
+			if rspAppend.Success {
+				return
+			}
+		case voteReply := <-voteReplyChan:
+			if voteReply.VoteGranted {
+				voteCount += 1
+				if voteCount >= len(rf.peers)/2+1 {
+					rf.currentRaftState = leader
+					return
+				}
+			} else {
+				if voteReply.Term > rf.currentTerm {
+					rf.currentTerm = voteReply.Term
+					rf.currentRaftState = follower
+					rf.votedFor = voteReply.FromId
+					return
+				}
+			}
+		}
+
+	}
+}
+
+func leaderHandler(rf *Raft) {
+	// - send out heatbeat immediately as initial step then send out periodcally
+	// - handle heartbeat timeout, then send it out peridically
+	// - handle AppendEntries,
+	// - handle RequestVote
+	rf.printInfo()
+	timer := time.After(0)
+	appendReplyChan := make(chan *AppendEntriesReply)
+	sendAppendTask := func(term int, me int, destServer int, appendReplyChan chan *AppendEntriesReply) {
+		argvs := AppendEntriesArgs{
+			Term:   term,
+			LeadId: me,
+		}
+		reply := AppendEntriesReply{}
+		if rf.sendAppendEntries(destServer, &argvs, &reply) {
+			appendReplyChan <- &reply
+		}
+	}
+
+	for {
+		select {
+		case <-timer:
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				go sendAppendTask(rf.currentTerm, rf.me, i, appendReplyChan)
+			}
+			timer = time.After(HEARTBEAT_TIMEOUT_MILISECONDS)
+		case reqVote := <-rf.RequestVoteArgsChan:
+			rspVote := RequestVoteReply{
+				Term:        rf.currentTerm,
+				VoteGranted: false,
+				FromId:      rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqVote.Term > rf.currentTerm {
+				rf.currentTerm = reqVote.Term
+				rf.currentRaftState = follower
+				rf.votedFor = reqVote.CandidateId
+				rspVote.VoteGranted = true
+			}
+			rspVote.Term = rf.currentTerm
+			rf.RequestVoteReplyChan <- &rspVote
+			// if grant vote for a leader, return to be follower
+			if rspVote.VoteGranted {
+				return
+			}
+		case reqAppend := <-rf.AppendEntriesArgsChan:
+			rspAppend := AppendEntriesReply{
+				Term:    rf.currentTerm,
+				Success: false,
+				FromId:  rf.me,
+			}
+			// per Fig2 rule when receiving higher term
+			if reqAppend.Term > rf.currentTerm {
+				rf.currentTerm = reqAppend.Term
+				rf.currentRaftState = follower
+				rf.votedFor = reqAppend.LeadId
+				rspAppend.Success = true
+			}
+			rspAppend.Term = rf.currentTerm
+			rf.AppendEntriesReplyChan <- &rspAppend
+			// if ack an Append RPC, return to follower state
+			if rspAppend.Success {
+				return
+			}
+		case appendReply := <-appendReplyChan:
+			if appendReply.Term > rf.currentTerm {
+				rf.currentRaftState = follower
+				rf.currentTerm = appendReply.Term
+				rf.votedFor = appendReply.FromId
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) printInfo() {
+	log.Printf("[%v] enter %s state , term:%v\n", rf.me, rf.currentRaftState, rf.currentTerm)
 }
