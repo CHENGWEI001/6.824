@@ -15,8 +15,8 @@ go test -run 2A 1> out.txt 2> log.txt -v
 * for candidate, when sending vote, if RPC fail ( no response from follower ), I assume shouldn't re-send the vote ( can't find into in the paper)
 * struct to RPC need to have all filed with first letter capitalized
 * If leaderId != rf.votedFor, but term the same , should reject and check it ?
+* Below case seems sometimes stuck
 ```
-Test (2B): leader backs up quickly over incorrect follower logs ...
-exit status 1
-FAIL	raft	46.101s
+=== RUN   TestReliableChurn2C
+Test (2C): churn ...
 ```
