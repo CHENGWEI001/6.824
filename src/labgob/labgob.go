@@ -168,6 +168,9 @@ func checkDefault1(value reflect.Value, depth int, name string) {
 				// state into variable that already have non-default values.
 				fmt.Printf("labgob warning: Decoding into a non-default variable/field %v may not work\n",
 					what)
+				panic(fmt.Sprintf("t: %+v, value: %+v, %+v, %+v", t, value,
+					reflect.Zero(t).Interface(),
+					value.Interface()))
 			}
 			errorCount += 1
 			mu.Unlock()
