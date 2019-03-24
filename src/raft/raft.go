@@ -53,6 +53,7 @@ type ApplyMsg struct {
 const ELECTION_TIMEOUT_MILISECONDS = 500
 const ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS = 500
 const HEARTBEAT_TIMEOUT_MILISECONDS = 200
+const LEADER_PEER_TICK_MILISECONDS = 200
 const INITIAL_VOTED_FOR = -1
 
 type Raft struct {
@@ -65,28 +66,29 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	CurrentTerm            int                      // current term of raft instance
-	VotedFor               int                      // previous vote for who, initial to -1
-	CurrentRaftState       RaftState                // current raft state
-	RequestVoteArgsChan    chan *RequestVoteArgs    // channel for receiving Request Vote
-	RequestVoteReplyChan   chan *RequestVoteReply   // channel for response Request Vote
-	AppendEntriesArgsChan  chan *AppendEntriesArgs  // channel for receiving Append Entry
-	AppendEntriesReplyChan chan *AppendEntriesReply // channel for response Append Entry
-	Log                    []LogEntry               // log entries
-	CommitIndex            int                      // indx of highest log entry known to be committed
-	LastApplied            int                      // index of highest log entry applied to state machine
-	NextIndex              []int                    // index of the next log entry to send to the server
-	MatchIndex             []int                    // index of highest log entry known to be replicated on server
-	ApplyChChan            chan *ApplychArgs        // channel for receiving ApplyCh from client
-	ApplyMsgChan           chan ApplyMsg            // channel for updating to tester
-	ToStopChan             chan bool                // channel for stopping the raft instance thread
-	ToStop                 bool                     // indicator for stopping raft instance
-	GetStateReqChan        chan *GetStateReq        // channel for GetState API input
-	GetStateReplyChan      chan *GetStateReply      // channel for GetState API output
-	StartReqChan           chan *StartReq           // channel for Start API input
-	StartReplyChan         chan *StartReply         // channel for Start API output
-	PrevApplyMsgToken      chan int64               // channel for scheduling go routine to sendMsg to tester
-	NextApplyMsgToken      chan int64               // channel for scheduling go routine to sendMsg to tester
+	CurrentTerm             int                      // current term of raft instance
+	VotedFor                int                      // previous vote for who, initial to -1
+	CurrentRaftState        RaftState                // current raft state
+	RequestVoteArgsChan     chan *RequestVoteArgs    // channel for receiving Request Vote
+	RequestVoteReplyChan    chan *RequestVoteReply   // channel for response Request Vote
+	AppendEntriesArgsChan   chan *AppendEntriesArgs  // channel for receiving Append Entry
+	AppendEntriesReplyChan  chan *AppendEntriesReply // channel for response Append Entry
+	Log                     []LogEntry               // log entries
+	CommitIndex             int                      // indx of highest log entry known to be committed
+	LastApplied             int                      // index of highest log entry applied to state machine
+	NextIndex               []int                    // index of the next log entry to send to the server
+	MatchIndex              []int                    // index of highest log entry known to be replicated on server
+	ApplyChChan             chan *ApplychArgs        // channel for receiving ApplyCh from client
+	ApplyMsgChan            chan ApplyMsg            // channel for updating to tester
+	ToStopChan              chan bool                // channel for stopping the raft instance thread
+	ToStop                  bool                     // indicator for stopping raft instance
+	GetStateReqChan         chan *GetStateReq        // channel for GetState API input
+	GetStateReplyChan       chan *GetStateReply      // channel for GetState API output
+	StartReqChan            chan *StartReq           // channel for Start API input
+	StartReplyChan          chan *StartReply         // channel for Start API output
+	PrevApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
+	NextApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
+	LastAppendEntrySentTime []time.Time              // last time stamp sent appendEntry
 }
 
 type GetStateReq struct {
@@ -300,16 +302,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// DPrintf("[RPC][RequestVote][%v -> %v]: %+v\n", args.CandidateId, server, *args)
+	DPrintf("[RPC][RequestVote][%v -> %v]: args: %+v\n", args.CandidateId, server, *args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	// DPrintf("[RPC][RequestVote][%v <- %v]: %+v\n", args.CandidateId, reply.FromId, *reply)
+	DPrintf("[RPC][RequestVote][%v <- %v]: ok: %v, reply: %+v\n", args.CandidateId, server, ok, *reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// DPrintf("[RPC][AppendEntries][%v -> %v]: %+v\n", args.LeadId, server, *args)
+	DPrintf("[RPC][AppendEntries][%v -> %v]: args: %+v\n", args.LeadId, server, *args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	// DPrintf("[RPC][AppendEntries][%v <- %v]: %+v\n", args.LeadId, reply.FromId, *reply)
+	DPrintf("[RPC][AppendEntries][%v <- %v]: ok: %v, reply: %+v\n", args.LeadId, server, ok, *reply)
 	return ok
 }
 
@@ -445,6 +447,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.StartReplyChan = make(chan *StartReply)
 	rf.PrevApplyMsgToken = make(chan int64)
 	rf.NextApplyMsgToken = make(chan int64)
+	rf.LastAppendEntrySentTime = make([]time.Time, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -543,10 +546,10 @@ func followerHandler(rf *Raft) {
 	rf.printInfo()
 	timer := time.After(getRandElectionTimeoutMiliSecond())
 	for {
-		rf.persist()
 		select {
 		case <-timer:
 			rf.CurrentRaftState = candidate
+			rf.persist()
 			return
 		case reqVote := <-rf.RequestVoteArgsChan:
 			rspVote := RequestVoteReply{
@@ -568,6 +571,7 @@ func followerHandler(rf *Raft) {
 			}
 			rspVote.Term = rf.CurrentTerm
 			rf.RequestVoteReplyChan <- &rspVote
+			rf.persist()
 			// if grant vote for a leader, reset timer
 			if rspVote.VoteGranted {
 				return
@@ -613,7 +617,8 @@ func followerHandler(rf *Raft) {
 			rspAppend.VotedFor = rf.VotedFor
 			rf.AppendEntriesReplyChan <- &rspAppend
 			// if ack an Append RPC, reset timer
-			if rspAppend.Success {
+			if rspAppend.Success || rf.VotedFor == reqAppend.LeadId {
+				rf.persist()
 				return
 			}
 		case <-rf.ToStopChan:
@@ -668,7 +673,6 @@ func candidateHandler(rf *Raft) {
 	for {
 		select {
 		case <-timer:
-			rf.persist()
 			return
 		case reqVote := <-rf.RequestVoteArgsChan:
 			rspVote := RequestVoteReply{
@@ -723,7 +727,7 @@ func candidateHandler(rf *Raft) {
 		case StartReq := <-rf.StartReqChan:
 			rf.StartHelper(StartReq)
 		}
-
+		rf.persist()
 	}
 }
 
@@ -746,6 +750,10 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 		LeaderCommit: rf.CommitIndex,
 	}
 	tmpLog := rf.Log[rf.NextIndex[destServer]:len(rf.Log)]
+	//if we don't have any new entry and now over heartbeat interval, don't sent the RPC
+	if len(tmpLog) == 0 && time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
+		return
+	}
 	argvs.Entries = make([]LogEntry, len(tmpLog))
 	copy(argvs.Entries, tmpLog)
 	reply := AppendEntriesReply{}
@@ -754,6 +762,7 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 			appendReplyChan <- &reply
 		}
 	}()
+	rf.LastAppendEntrySentTime[destServer] = time.Now()
 }
 
 // to update leader's commit index whenever received AppendEntries success
@@ -826,8 +835,7 @@ func leaderHandler(rf *Raft) {
 				}
 				rf.appendEntriesHelper(i, appendReplyChan)
 			}
-			timer = time.After(HEARTBEAT_TIMEOUT_MILISECONDS * time.Millisecond)
-			rf.persist()
+			timer = time.After(LEADER_PEER_TICK_MILISECONDS * time.Millisecond)
 		case reqVote := <-rf.RequestVoteArgsChan:
 			rspVote := RequestVoteReply{
 				Term:        rf.CurrentTerm,
@@ -869,6 +877,7 @@ func leaderHandler(rf *Raft) {
 				rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
 				rf.MatchIndex[appendReply.FromId] = appendReply.NextIndex - 1
 				rf.updateLeaderCommitIndex()
+				rf.persist()
 			} else {
 				// if fail, follower tell leader from where to try is better,
 				// ignore the rsp if this follower is not voting to it
@@ -883,6 +892,8 @@ func leaderHandler(rf *Raft) {
 			rf.GetStateHelper()
 		case StartReq := <-rf.StartReqChan:
 			rf.StartHelper(StartReq)
+			// once we receive new entry, we should send out append Entry to peers immediately
+			timer = time.After(0)
 		}
 		// DPrintf("[%v][leaderHandler] end of for loop", rf.me)
 	}

@@ -6,7 +6,7 @@ import "math/big"
 import "fmt"
 
 // import "time"
-import "log"
+// import "log"
 
 // idea from https://www.callicoder.com/distributed-unique-id-sequence-number-generator/
 // const REQID_TIME_SHIFT = 22
@@ -40,7 +40,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.lastLeader = 0
 	ck.Uuid = nrand()
-	log.Printf("[CK:%v][MakeClerk]: ck:%+v\n", ck.Uuid, ck)
+	DPrintf("[CK:%v][MakeClerk]: ck:%+v\n", ck.Uuid, ck)
 	return ck
 }
 
@@ -57,7 +57,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	log.Printf("[CK:%v][Get]: key:%v\n", ck.Uuid, key)
+	DPrintf("[CK:%v][Get]: key:%v\n", ck.Uuid, key)
 	args := GetArgs{
 		Key:      key,
 		ReqId:    nrand(),
@@ -66,14 +66,14 @@ func (ck *Clerk) Get(key string) string {
 	ok := false
 	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
 		reply := GetReply{}
-		log.Printf("[CK:%v][Get]: ->%v, args:%+v\n", ck.Uuid, i, args)
+		DPrintf("[CK:%v][Get]: ->%v, args:%+v\n", ck.Uuid, i, args)
 		ok = ck.servers[i].Call("KVServer.Get", &args, &reply)
 		if ok && !reply.WrongLeader {
 			if reply.ClientId != args.ClientId {
 				panic(fmt.Sprintf("[CK:%v][Get] ClientId not matching! %v != %v!\n", ck.Uuid, args.ClientId, reply.ClientId))
 			}
 			ck.lastLeader = i
-			log.Printf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
+			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
 			return reply.Value
 		}
 	}
@@ -91,7 +91,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	log.Printf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v\n", ck.Uuid, key, value, op)
+	DPrintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v\n", ck.Uuid, key, value, op)
 
 	args := PutAppendArgs{
 		Key:      key,
@@ -103,10 +103,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ok := false
 	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
 		reply := PutAppendReply{}
-		log.Printf("[CK:%v][PutAppend]: ->%v ,args:%+v\n", ck.Uuid, i, args)
+		DPrintf("[CK:%v][PutAppend]: ->%v ,args:%+v\n", ck.Uuid, i, args)
 		ok = ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 		if ok && !reply.WrongLeader {
-			log.Printf("[CK:%v][PutAppend]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
+			DPrintf("[CK:%v][PutAppend]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
 			if reply.ClientId != args.ClientId {
 				panic(fmt.Sprintf("[CK:%v][PutAppend] ClientId not matching! %v != %v!\n", ck.Uuid, args.ClientId, reply.ClientId))
 			}
@@ -114,7 +114,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			break
 		}
 	}
-	log.Printf("[CK:%v][PutAppend]: done ReqId:%+v\n", ck.Uuid, args.ReqId)
+	DPrintf("[CK:%v][PutAppend]: done ReqId:%+v\n", ck.Uuid, args.ReqId)
 }
 
 func (ck *Clerk) Put(key string, value string) {
