@@ -238,14 +238,17 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int        // term of prevLogIndex entry
 	Entries      []LogEntry // log entries to store ( empty for heartbeat )
 	LeaderCommit int        // leader's commitIndex
+	TimeStamp    int64      // time this req sent
 }
 
 type AppendEntriesReply struct {
-	Term      int  // current term , for leader to update itself
-	Success   bool // [ToDo]
-	FromId    int  // indicating this reply is from which raft instance
-	NextIndex int  // if success: nextIndex for this follower, if failure: next Index to try
-	VotedFor  int  // Replay current votedFor for the raft Instace
+	Term      int   // current term , for leader to update itself
+	Success   bool  // [ToDo]
+	FromId    int   // indicating this reply is from which raft instance
+	NextIndex int   // if success: nextIndex for this follower, if failure: next Index to try
+	VotedFor  int   // Replay current votedFor for the raft Instace
+	TimeStamp int64 // time this req sent
+	IsValid   bool  // to indidate if sender can ignore this Reply, this is to handle out of order AppendEntry case
 }
 
 type ApplychArgs struct {
@@ -545,6 +548,7 @@ func followerHandler(rf *Raft) {
 	// - handle RequestVote
 	rf.printInfo()
 	timer := time.After(getRandElectionTimeoutMiliSecond())
+	var lastAppendEntryReq *AppendEntriesArgs
 	for {
 		select {
 		case <-timer:
@@ -583,6 +587,8 @@ func followerHandler(rf *Raft) {
 				FromId:    rf.me,
 				NextIndex: reqAppend.PrevLogIndex + 1,
 				VotedFor:  rf.VotedFor,
+				TimeStamp: time.Now().UnixNano(),
+				IsValid:   true,
 			}
 			// per Fig2 rule when receiving higher term
 			if reqAppend.Term > rf.CurrentTerm {
@@ -592,6 +598,13 @@ func followerHandler(rf *Raft) {
 			// DPrintf("[followerHandler][%v]: %+v, %+v\n", reqAppend, rf)
 			// what if leaderId != rf.VotedFor, but term the same , should reject and check it ?
 			if reqAppend.Term >= rf.CurrentTerm && reqAppend.LeadId == rf.VotedFor {
+				if lastAppendEntryReq != nil && lastAppendEntryReq.TimeStamp >= reqAppend.TimeStamp {
+					DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, *lastAppendEntryReq)
+					rspAppend.IsValid = false
+					rf.AppendEntriesReplyChan <- &rspAppend
+					continue
+				}
+				lastAppendEntryReq = reqAppend
 				if reqAppend.PrevLogIndex < len(rf.Log) && rf.Log[reqAppend.PrevLogIndex].Term == reqAppend.PrevLogTerm {
 					// refer to https://stackoverflow.com/questions/16248241/concatenate-two-slices-in-go
 					rf.Log = append(rf.Log[:reqAppend.PrevLogIndex+1], reqAppend.Entries...)
@@ -748,6 +761,7 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 		PrevLogIndex: rf.NextIndex[destServer] - 1,
 		PrevLogTerm:  rf.Log[rf.NextIndex[destServer]-1].Term,
 		LeaderCommit: rf.CommitIndex,
+		TimeStamp:    time.Now().UnixNano(),
 	}
 	tmpLog := rf.Log[rf.NextIndex[destServer]:len(rf.Log)]
 	//if we don't have any new entry and now over heartbeat interval, don't sent the RPC
@@ -759,7 +773,9 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 	reply := AppendEntriesReply{}
 	go func() {
 		if rf.sendAppendEntries(destServer, &argvs, &reply) {
-			appendReplyChan <- &reply
+			if reply.IsValid {
+				appendReplyChan <- &reply
+			}
 		}
 	}()
 	rf.LastAppendEntrySentTime[destServer] = time.Now()
@@ -822,6 +838,7 @@ func leaderHandler(rf *Raft) {
 	rf.printInfo()
 	timer := time.After(0)
 	appendReplyChan := make(chan *AppendEntriesReply)
+	lastAppendReqly := make([]*AppendEntriesReply, len(rf.peers))
 
 	for {
 		DPrintf("[%v][leaderHandler] start of for loop: rf:%+v", rf.me, rf)
@@ -866,6 +883,12 @@ func leaderHandler(rf *Raft) {
 			}
 			rf.AppendEntriesReplyChan <- &rspAppend
 		case appendReply := <-appendReplyChan:
+			DPrintf("[%v][leaderHandler] received appendReply:%+v", rf.me, appendReply)
+			if lastAppendReqly[appendReply.FromId] != nil && lastAppendReqly[appendReply.FromId].TimeStamp >= appendReply.TimeStamp {
+				DPrintf("[%v][leaderHandler] received older appendReply:%+v, lastAppendReqly:%+v", rf.me, appendReply, *lastAppendReqly[appendReply.FromId])
+				continue
+			}
+			lastAppendReqly[appendReply.FromId] = appendReply
 			if appendReply.Term > rf.CurrentTerm {
 				rf.updateTerm(appendReply.Term)
 				rf.updateState(follower)
