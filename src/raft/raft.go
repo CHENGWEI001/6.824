@@ -89,6 +89,8 @@ type Raft struct {
 	PrevApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
 	NextApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
 	LastAppendEntrySentTime []time.Time              // last time stamp sent appendEntry
+	SelfWorkerCloseChan     chan bool                // chan for closing self worker ( which is to handle applych)
+	SelfWorkerChan          chan interface{}         // channel to worker for sending ApplyMsg back to tester
 }
 
 type GetStateReq struct {
@@ -254,6 +256,16 @@ type AppendEntriesReply struct {
 type ApplychArgs struct {
 	command interface{}
 	status  chan int
+}
+
+type AppendEntriesWorkerReq struct {
+	args      *AppendEntriesArgs
+	replyChan chan *AppendEntriesReply
+}
+
+type RequestVoteWorkerReq struct {
+	args      *RequestVoteArgs
+	replyChan chan *RequestVoteReply
 }
 
 //
@@ -457,15 +469,142 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.initIndex()
 	DPrintf("[%v][Make]: rf:%+v\n", rf.me, rf)
 
+	// start self worker which is for applyCh
+	rf.startSelfWorker()
+
 	// start raft main thread
 	go startRaftThread(rf)
 
 	// start first sendMsg scheduling thread
-	go func(nextToken chan int64) {
-		nextToken <- time.Now().Unix()
-	}(rf.PrevApplyMsgToken)
+	// go func(nextToken chan int64) {
+	// 	nextToken <- time.Now().Unix()
+	// }(rf.PrevApplyMsgToken)
 
 	return rf
+}
+
+// self Worker should start along with main rf thread
+func (rf *Raft) startSelfWorker() {
+	rf.SelfWorkerCloseChan = make(chan bool)
+	rf.SelfWorkerChan = make(chan interface{}, 8192)
+	go rf.startRaftWorkerThread(rf.me, rf.SelfWorkerCloseChan, rf.SelfWorkerChan, rf.CurrentTerm, rf.CurrentRaftState)
+}
+
+// self worker should stop along with main rf thread
+func (rf *Raft) stopSelfWorker() {
+	close(rf.SelfWorkerCloseChan)
+}
+
+func (rf *Raft) startRaftWorkerThread(id int, workerCloseChan chan bool, workerChan chan interface{},
+	term int, state RaftState) {
+	for {
+		select {
+		case msg := <-workerChan:
+			// DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), to handle TypeOf(msg):%+v, msg:%+v\n",
+			// 	rf.me, id, term, state, reflect.TypeOf(msg), msg)
+			switch msgType := msg.(type) {
+			case *ApplyMsg:
+				if applyMsg, ok := msg.(*ApplyMsg); ok {
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), to handle applyMsg:%+v\n",
+						rf.me, id, term, state, applyMsg)
+					rf.ApplyMsgChan <- *applyMsg
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), done handle applyMsg:%+v\n",
+						rf.me, id, term, state, applyMsg)
+				} else {
+					panic(fmt.Sprintf("[%v] Worker:(id:%v, term:%v, state:%v), can't handle msgType:%+v, msg:%+v\n",
+						rf.me, id, term, state, msgType, msg))
+				}
+			case AppendEntriesWorkerReq:
+				if appendEntriesWorkerReq, ok := msg.(AppendEntriesWorkerReq); ok {
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), to handle appendEntriesWorkerReq args:%+v\n",
+						rf.me, id, term, state, appendEntriesWorkerReq.args)
+					reply := AppendEntriesReply{}
+					ok := rf.sendAppendEntries(id, appendEntriesWorkerReq.args, &reply)
+					if ok {
+						appendEntriesWorkerReq.replyChan <- &reply
+					}
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), done handle appendEntriesWorkerReq ok:%+v, reply:%+v\n",
+						rf.me, id, term, state, ok, reply)
+				} else {
+					panic(fmt.Sprintf("[%v] Worker:(id:%v, term:%v, state:%v), can't handle msgType:%+v, msg:%+v\n",
+						rf.me, id, term, state, msgType, msg))
+				}
+			case RequestVoteWorkerReq:
+				if requestVoteWorkerReq, ok := msg.(RequestVoteWorkerReq); ok {
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), to handle requestVoteWorkerReq args:%+v\n",
+						rf.me, id, term, state, requestVoteWorkerReq.args)
+					reply := RequestVoteReply{}
+					ok := rf.sendRequestVote(id, requestVoteWorkerReq.args, &reply)
+					if ok {
+						requestVoteWorkerReq.replyChan <- &reply
+					}
+					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), done handle requestVoteWorkerReq ok:%+v, reply:%+v\n",
+						rf.me, id, term, state, ok, reply)
+				} else {
+					panic(fmt.Sprintf("[%v] Worker:(id:%v, term:%v, state:%v), can't handle msgType:%+v, msg:%+v\n",
+						rf.me, id, term, state, msgType, msg))
+				}
+			default:
+				panic(fmt.Sprintf("[%v] Worker:(id:%v, term:%v, state:%v), unexpected msgType:%+v, msg:%+v\n",
+					rf.me, id, term, state, msgType, msg))
+			}
+			// DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), done handle TypeOf(msg):%+v, msg:%+v\n",
+			// 	rf.me, id, term, state, reflect.TypeOf(msg), msg)
+		case <-workerCloseChan:
+			DPrintf("[%v]Close Worker:(id:%v, term:%v, state:%v) thread\n", rf.me, id, term, state)
+			return
+		}
+	}
+}
+
+func (rf *Raft) startRaftOneTimeWorkerThread(id int, msg interface{}, term int, state RaftState) {
+	startAt := time.Now()
+	switch msgType := msg.(type) {
+	case *ApplyMsg:
+		if applyMsg, ok := msg.(*ApplyMsg); ok {
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), to handle applyMsg:%+v\n",
+				rf.me, id, term, state, startAt, applyMsg)
+			rf.ApplyMsgChan <- *applyMsg
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), done handle applyMsg:%+v\n",
+				rf.me, id, term, state, startAt, applyMsg)
+		} else {
+			panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), can't handle msgType:%+v, msg:%+v\n",
+				rf.me, id, term, state, startAt, msgType, msg))
+		}
+	case AppendEntriesWorkerReq:
+		if appendEntriesWorkerReq, ok := msg.(AppendEntriesWorkerReq); ok {
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), to handle appendEntriesWorkerReq args:%+v\n",
+				rf.me, id, term, state, appendEntriesWorkerReq.args)
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(id, appendEntriesWorkerReq.args, &reply)
+			if ok {
+				appendEntriesWorkerReq.replyChan <- &reply
+			}
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), done handle appendEntriesWorkerReq ok:%+v, reply:%+v\n",
+				rf.me, id, term, state, startAt, ok, reply)
+		} else {
+			panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), can't handle msgType:%+v, msg:%+v\n",
+				rf.me, id, term, state, startAt, msgType, msg))
+		}
+	case RequestVoteWorkerReq:
+		if requestVoteWorkerReq, ok := msg.(RequestVoteWorkerReq); ok {
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), to handle requestVoteWorkerReq args:%+v\n",
+				rf.me, id, term, state, requestVoteWorkerReq.args)
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(id, requestVoteWorkerReq.args, &reply)
+			if ok {
+				requestVoteWorkerReq.replyChan <- &reply
+			}
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), done handle requestVoteWorkerReq ok:%+v, reply:%+v\n",
+				rf.me, id, term, state, startAt, ok, reply)
+		} else {
+			panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), can't handle msgType:%+v, msg:%+v\n",
+				rf.me, id, term, state, startAt, msgType, msg))
+		}
+	default:
+		panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), unexpected msgType:%+v, msg:%+v\n",
+			rf.me, id, term, state, startAt, msgType, msg))
+	}
 }
 
 // start point of raft thread, each raft instance is one thread, and it would
@@ -484,6 +623,7 @@ func startRaftThread(rf *Raft) {
 			panic(fmt.Sprintf("unexpected raft state: %v", state))
 		}
 		if rf.ToStop {
+			rf.stopSelfWorker()
 			return
 		}
 	}
@@ -528,15 +668,16 @@ func (rf *Raft) sendApplyMsg(start int, end int) {
 			Command:      rf.Log[i].Command,
 			CommandIndex: i,
 		}
-		go func(msg ApplyMsg, prevToken chan int64, nextToken chan int64) {
-			// DPrintf("[%v]sendApplyMsg: %+v, %+v\n", rf.me, msg, rf)
-			<-prevToken
-			DPrintf("[%v]to sendApplyMsg: %+v\n", rf.me, msg)
-			rf.ApplyMsgChan <- msg
-			DPrintf("[%v]after sendApplyMsg: %+v\n", rf.me, msg)
-			nextToken <- time.Now().Unix()
-		}(msg, rf.PrevApplyMsgToken, rf.NextApplyMsgToken)
-		rf.PrevApplyMsgToken, rf.NextApplyMsgToken = rf.NextApplyMsgToken, make(chan int64)
+		// go func(msg ApplyMsg, prevToken chan int64, nextToken chan int64) {
+		// 	// DPrintf("[%v]sendApplyMsg: %+v, %+v\n", rf.me, msg, rf)
+		// 	<-prevToken
+		// 	DPrintf("[%v]to sendApplyMsg: %+v\n", rf.me, msg)
+		// 	rf.ApplyMsgChan <- msg
+		// 	DPrintf("[%v]after sendApplyMsg: %+v\n", rf.me, msg)
+		// 	nextToken <- time.Now().Unix()
+		// }(msg, rf.PrevApplyMsgToken, rf.NextApplyMsgToken)
+		// rf.PrevApplyMsgToken, rf.NextApplyMsgToken = rf.NextApplyMsgToken, make(chan int64)
+		rf.SelfWorkerChan <- &msg
 	}
 	// update LastApplied after we apply to state machine
 	rf.LastApplied = end
@@ -661,34 +802,40 @@ func candidateHandler(rf *Raft) {
 	rf.CurrentTerm += 1
 	rf.printInfo()
 	timer := time.After(getRandElectionTimeoutMiliSecond())
-	voteReplyChan := make(chan *RequestVoteReply)
+	voteReplyChan := make(chan *RequestVoteReply, 8192)
 	// vote for itself and send vote to followers
 	rf.VotedFor = rf.me
 	voteCount := 1
-	sendVoteTask := func(term int, me int, destServer int, voteReplyChan chan *RequestVoteReply, argvs *RequestVoteArgs) {
-		// argvs := RequestVoteArgs{
-		// 	Term:         term,
-		// 	CandidateId:  me,
-		// 	LastLogIndex: len(rf.Log) - 1,
-		// 	LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
-		// }
-		reply := RequestVoteReply{}
-		if rf.sendRequestVote(destServer, argvs, &reply) {
-			voteReplyChan <- &reply
-		}
-	}
+	// sendVoteTask := func(term int, me int, destServer int, voteReplyChan chan *RequestVoteReply, argvs *RequestVoteArgs) {
+	// 	// argvs := RequestVoteArgs{
+	// 	// 	Term:         term,
+	// 	// 	CandidateId:  me,
+	// 	// 	LastLogIndex: len(rf.Log) - 1,
+	// 	// 	LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+	// 	// }
+	// 	reply := RequestVoteReply{}
+	// 	if rf.sendRequestVote(destServer, argvs, &reply) {
+	// 		voteReplyChan <- &reply
+	// 	}
+	// }
 
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		argvs := &RequestVoteArgs{
+		argvs := RequestVoteArgs{
 			Term:         rf.CurrentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: len(rf.Log) - 1,
 			LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
 		}
-		go sendVoteTask(rf.CurrentTerm, rf.me, i, voteReplyChan, argvs)
+		// go sendVoteTask(rf.CurrentTerm, rf.me, i, voteReplyChan, &argvs)
+		workerReq := RequestVoteWorkerReq{
+			args:      &argvs,
+			replyChan: voteReplyChan,
+		}
+		go rf.startRaftOneTimeWorkerThread(i, workerReq, rf.CurrentTerm, rf.CurrentRaftState)
+
 	}
 
 	for {
@@ -787,14 +934,19 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 	}
 	argvs.Entries = make([]LogEntry, len(tmpLog))
 	copy(argvs.Entries, tmpLog)
-	reply := AppendEntriesReply{}
-	go func() {
-		if rf.sendAppendEntries(destServer, &argvs, &reply) {
-			if reply.IsValid {
-				appendReplyChan <- &reply
-			}
-		}
-	}()
+	// reply := AppendEntriesReply{}
+	// go func() {
+	// 	if rf.sendAppendEntries(destServer, &argvs, &reply) {
+	// 		if reply.IsValid {
+	// 			appendReplyChan <- &reply
+	// 		}
+	// 	}
+	// }()
+	workerReq := AppendEntriesWorkerReq{
+		args:      &argvs,
+		replyChan: appendReplyChan,
+	}
+	go rf.startRaftOneTimeWorkerThread(destServer, workerReq, rf.CurrentTerm, rf.CurrentRaftState)
 	rf.LastAppendEntrySentTime[destServer] = time.Now()
 }
 
@@ -854,7 +1006,7 @@ func leaderHandler(rf *Raft) {
 	// rf.AppendNoOpEntry()
 	rf.printInfo()
 	timer := time.After(0)
-	appendReplyChan := make(chan *AppendEntriesReply)
+	appendReplyChan := make(chan *AppendEntriesReply, 8192)
 	lastAppendReqly := make([]*AppendEntriesReply, len(rf.peers))
 
 	for {
