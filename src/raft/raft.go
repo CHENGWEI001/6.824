@@ -550,12 +550,15 @@ func followerHandler(rf *Raft) {
 	timer := time.After(getRandElectionTimeoutMiliSecond())
 	var lastAppendEntryReq *AppendEntriesArgs
 	for {
+		DPrintf("[%v][followerHandler] start of for loop: rf:%+v", rf.me, rf)
 		select {
 		case <-timer:
+			DPrintf("[%v][followerHandler] timer is up", rf.me)
 			rf.CurrentRaftState = candidate
 			rf.persist()
 			return
 		case reqVote := <-rf.RequestVoteArgsChan:
+			DPrintf("[%v][followerHandler] received reqVote:%+v", rf.me, reqVote)
 			rspVote := RequestVoteReply{
 				Term:        rf.CurrentTerm,
 				VoteGranted: false,
@@ -581,6 +584,7 @@ func followerHandler(rf *Raft) {
 				return
 			}
 		case reqAppend := <-rf.AppendEntriesArgsChan:
+			DPrintf("[%v][followerHandler] received reqAppend:%+v", rf.me, reqAppend)
 			rspAppend := AppendEntriesReply{
 				Term:      rf.CurrentTerm,
 				Success:   false,
@@ -635,12 +639,16 @@ func followerHandler(rf *Raft) {
 				return
 			}
 		case <-rf.ToStopChan:
+			DPrintf("[%v][followerHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 		case <-rf.GetStateReqChan:
+			DPrintf("[%v][followerHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
 		case StartReq := <-rf.StartReqChan:
+			DPrintf("[%v][followerHandler] received StartReqChan:%+v", rf.me, StartReq)
 			rf.StartHelper(StartReq)
 		}
+		DPrintf("[%v][followerHandler] end of for loop: rf:%+v", rf.me, rf)
 	}
 }
 
@@ -684,10 +692,13 @@ func candidateHandler(rf *Raft) {
 	}
 
 	for {
+		DPrintf("[%v][candidateHandler] start of for loop: rf:%+v", rf.me, rf)
 		select {
 		case <-timer:
+			DPrintf("[%v][candidateHandler] timer is up", rf.me)
 			return
 		case reqVote := <-rf.RequestVoteArgsChan:
+			DPrintf("[%v][candidateHandler] received reqVote:%+v", rf.me, reqVote)
 			rspVote := RequestVoteReply{
 				Term:        rf.CurrentTerm,
 				VoteGranted: false,
@@ -702,6 +713,7 @@ func candidateHandler(rf *Raft) {
 			}
 			rf.RequestVoteReplyChan <- &rspVote
 		case reqAppend := <-rf.AppendEntriesArgsChan:
+			DPrintf("[%v][candidateHandler] received reqAppend:%+v", rf.me, reqAppend)
 			rspAppend := AppendEntriesReply{
 				Term:     rf.CurrentTerm,
 				Success:  false,
@@ -719,6 +731,7 @@ func candidateHandler(rf *Raft) {
 			}
 			rf.AppendEntriesReplyChan <- &rspAppend
 		case voteReply := <-voteReplyChan:
+			DPrintf("[%v][candidateHandler] received voteReply:%+v", rf.me, voteReply)
 			if voteReply.VoteGranted {
 				voteCount += 1
 				if voteCount >= len(rf.peers)/2+1 {
@@ -734,12 +747,16 @@ func candidateHandler(rf *Raft) {
 				}
 			}
 		case <-rf.ToStopChan:
+			DPrintf("[%v][candidateHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 		case <-rf.GetStateReqChan:
+			DPrintf("[%v][candidateHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
 		case StartReq := <-rf.StartReqChan:
+			DPrintf("[%v][candidateHandler] received StartReqChan:%+v", rf.me, StartReq)
 			rf.StartHelper(StartReq)
 		}
+		DPrintf("[%v][candidateHandler] start of for loop: rf:%+v", rf.me, rf)
 		rf.persist()
 	}
 }
@@ -844,6 +861,7 @@ func leaderHandler(rf *Raft) {
 		DPrintf("[%v][leaderHandler] start of for loop: rf:%+v", rf.me, rf)
 		select {
 		case <-timer:
+			DPrintf("[%v][leaderHandler] timer is up", rf.me)
 			for i := range rf.peers {
 				if i == rf.me {
 					rf.NextIndex[rf.me] = len(rf.Log)
@@ -854,6 +872,7 @@ func leaderHandler(rf *Raft) {
 			}
 			timer = time.After(LEADER_PEER_TICK_MILISECONDS * time.Millisecond)
 		case reqVote := <-rf.RequestVoteArgsChan:
+			DPrintf("[%v][leaderHandler] received reqVote:%+v", rf.me, reqVote)
 			rspVote := RequestVoteReply{
 				Term:        rf.CurrentTerm,
 				VoteGranted: false,
@@ -868,6 +887,7 @@ func leaderHandler(rf *Raft) {
 			}
 			rf.RequestVoteReplyChan <- &rspVote
 		case reqAppend := <-rf.AppendEntriesArgsChan:
+			DPrintf("[%v][leaderHandler] received reqAppend:%+v", rf.me, reqAppend)
 			rspAppend := AppendEntriesReply{
 				Term:     rf.CurrentTerm,
 				Success:  false,
@@ -910,15 +930,18 @@ func leaderHandler(rf *Raft) {
 				}
 			}
 		case <-rf.ToStopChan:
+			DPrintf("[%v][leaderHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 		case <-rf.GetStateReqChan:
+			DPrintf("[%v][leaderHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
 		case StartReq := <-rf.StartReqChan:
+			DPrintf("[%v][leaderHandler] received StartReq:%+v", rf.me, StartReq)
 			rf.StartHelper(StartReq)
 			// once we receive new entry, we should send out append Entry to peers immediately
 			timer = time.After(0)
 		}
-		// DPrintf("[%v][leaderHandler] end of for loop", rf.me)
+		DPrintf("[%v][leaderHandler] end of for loop, rf:%+v", rf.me, rf)
 	}
 }
 
