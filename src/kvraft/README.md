@@ -1,3 +1,9 @@
+# TODO
+* is making below to blocking call safe?
+```
+					go func(msg SendMsg, reply *SendMsgReply) {
+```
+
 # Steps
 ```
 GOPATH=/home/ec2-user/environment/6.824/
@@ -48,3 +54,4 @@ go test -run 3A 1> out.txt 2> log.txt -v
   ```
 
 * I need to check update interval for every 10ms and not to resend the msg ( original checking every 100ms too long)
+* the get request should only get data from KV raft after the command commited, if I get data when just received request but not yet commit, the kv state might not get up to data until that get request command index, that case may get stale data ( like get something which is not has previous put command)

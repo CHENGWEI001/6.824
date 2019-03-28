@@ -20,19 +20,23 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type SendMsgReply struct {
+type SendMsgResult struct {
 	Valid bool
 	Value string
 }
+
 type SendMsgArgs struct {
-	Command Op
+	Command   Op
+	ResChan   chan *SendMsgResult
+	ExpCmtIdx int
 }
 
-type SendMsg struct {
-	Args      *SendMsgArgs
-	ReplyChan chan *SendMsgReply
-	ExpCmtIdx int
-	Done      bool
+type SendMsgReply struct {
+	WrongLeader bool
+	ReqId       int64
+	Value       string
+	ClientId    int64
+	Err         Err
 }
 
 type OpCode string
@@ -64,38 +68,29 @@ type KVServer struct {
 
 	// Your definitions here.
 	Uuid           int64
-	LastAppliedReq map[int64]int64 // to store last requestId from each client, here assume one client would send one reuqest at a time
-	PendingQ       map[int]SendMsg // to store cmd send to RAFT but not yet complete
-	SendMsgChan    chan SendMsg    // channel for receiving new msg from client
+	LastAppliedReq map[int64]int64      // to store last requestId from each client, here assume one client would send one reuqest at a time
+	PendingQ       map[int]*SendMsgArgs // to store cmd send to RAFT but not yet complete
+	SendMsgChan    chan *SendMsgArgs    // channel for receiving new msg from client
 	State          map[string]string
-	ToStopChan     chan bool    // channel for stopping the raft instance thread
-	ToStop         bool         // indicator for stopping raft instance
-	PendingQChan   chan SendMsg // channel for add item into PendingQ
+	ToStopChan     chan bool         // channel for stopping the raft instance thread
+	ToStop         bool              // indicator for stopping raft instance
+	PendingQChan   chan *SendMsgArgs // channel for add item into PendingQ
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	DPrintf("[KV:%v][Get]: GetArgs:%+v\n", kv.me, args)
-	defer DPrintf("[KV:%v][Get]: GetReply:%+v\n", kv.me, reply)
-	s := SendMsg{
-		Args: &SendMsgArgs{
-			Command: Op{
-				Oc:       GET,
-				Key:      args.Key,
-				ReqId:    args.ReqId,
-				ClientId: args.ClientId,
-			},
-		},
-	}
+// the worker handler to send new request msg to KV raft main thread
+func (kv *KVServer) SendMsgTask(args *SendMsgArgs, reply *SendMsgReply) {
+	startAt := time.Now().UnixNano()
+	DPrintf("[kv:%v]start SendMsgTask: startAt:%+v, args%+v\n", kv.me, startAt, args)
 	timer := time.After(0)
 	msgSent := false
 	// whenever Reply return with valid, kv.State should already been updated with latest
 	for {
 		select {
-		case res := <-s.ReplyChan:
+		case res := <-args.ResChan:
 			reply.WrongLeader = !res.Valid
-			reply.ReqId = args.ReqId
+			reply.ReqId = args.Command.ReqId
 			reply.Value = res.Value
-			reply.ClientId = args.ClientId
+			reply.ClientId = args.Command.ClientId
 			goto End
 		case <-timer:
 			_, isLeader := kv.rf.GetState()
@@ -104,11 +99,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				goto End
 			}
 			if !msgSent {
-				s.ReplyChan = make(chan *SendMsgReply)
-				DPrintf("[KV:%v][Get]: Sending GetArgs:%+v\n", kv.me, args)
-				kv.SendMsgChan <- s
+				args.ResChan = make(chan *SendMsgResult)
+				kv.SendMsgChan <- args
 				msgSent = true
-				DPrintf("[KV:%v][Get]: Comeback GetArgs:%+v\n", kv.me, args)
 			}
 			timer = time.After(AwaitLeaderCheckInterval)
 		}
@@ -116,8 +109,32 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 End:
 	// close(s.ReplyChan)
 	if reply.WrongLeader {
-		reply.Err = Err(fmt.Sprintf("[KV:%v][Get] No longer leader!", kv.me))
+		if !msgSent {
+			reply.Err = Err(fmt.Sprintf("[kv:%v] is not leader\n", kv.me))
+		} else {
+			reply.Err = Err(fmt.Sprintf("[kv:%v] was leader not anymore\n", kv.me))
+		}
 	}
+	reply.Err = Err(fmt.Sprintf("[kv:%v] OK\n", kv.me))
+}
+
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	DPrintf("[KV:%v][Get]: GetArgs:%+v\n", kv.me, args)
+	defer DPrintf("[KV:%v][Get]: GetReply:%+v\n", kv.me, reply)
+	s := SendMsgArgs{
+		Command: Op{
+			Oc:       GET,
+			Key:      args.Key,
+			ReqId:    args.ReqId,
+			ClientId: args.ClientId,
+		},
+	}
+	r := SendMsgReply{}
+	kv.SendMsgTask(&s, &r)
+	reply.WrongLeader = r.WrongLeader
+	reply.ReqId = r.ReqId
+	reply.Value = r.Value
+	reply.ClientId = r.ClientId
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -131,50 +148,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		panic(fmt.Sprintf("[KV:%v][PutAppend] un-expected opCode %+v!\n", kv.me, opCode))
 	}
-	s := SendMsg{
-		Args: &SendMsgArgs{
-			Command: Op{
-				Oc:       opCode,
-				Key:      args.Key,
-				Value:    args.Value,
-				ReqId:    args.ReqId,
-				ClientId: args.ClientId,
-			},
+	s := SendMsgArgs{
+		Command: Op{
+			Oc:       opCode,
+			Key:      args.Key,
+			Value:    args.Value,
+			ReqId:    args.ReqId,
+			ClientId: args.ClientId,
 		},
 	}
-	timer := time.After(0)
-	msgSent := false
-	for {
-		DPrintf("[KV:%v][PutAppend]: Start of the loop PutAppendArgs:%+v\n", kv.me, args)
-		select {
-		case res := <-s.ReplyChan:
-			reply.WrongLeader = !res.Valid
-			reply.ReqId = args.ReqId
-			reply.ClientId = args.ClientId
-			goto End
-		case <-timer:
-			_, isLeader := kv.rf.GetState()
-			if !isLeader {
-				reply.WrongLeader = true
-				goto End
-			}
-			if !msgSent {
-				s.ReplyChan = make(chan *SendMsgReply)
-				DPrintf("[KV:%v][PutAppend]: Sending PutAppendArgs:%+v\n", kv.me, args)
-				kv.SendMsgChan <- s
-				msgSent = true
-				DPrintf("[KV:%v][PutAppend]: Comeback PutAppendArgs:%+v\n", kv.me, args)
-			}
-			timer = time.After(AwaitLeaderCheckInterval)
-		}
-		DPrintf("[KV:%v][PutAppend]: End of the loop PutAppendArgs:%+v\n", kv.me, args)
-	}
-End:
-	// close(s.ReplyChan)
-	if reply.WrongLeader {
-		reply.Err = Err(fmt.Sprintf("[KV:%v][PutAppend] No longer leader!", kv.me))
-		return
-	}
+	r := SendMsgReply{}
+	kv.SendMsgTask(&s, &r)
+	reply.WrongLeader = r.WrongLeader
+	reply.ReqId = r.ReqId
+	reply.ClientId = r.ClientId
 }
 
 //
@@ -207,18 +194,19 @@ func (kv *KVServer) Unlock() {
 // 	kv.Unock()
 // }
 
-func (kv *KVServer) SendMsgTask(msg SendMsg) {
-	DPrintf("[kv:%v]start handling SendMsgTask: msg.Args%+v\n", kv.me, msg.Args)
-	index, _, isLeader := kv.rf.Start(msg.Args.Command)
+func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
+	startAt := time.Now().UnixNano()
+	DPrintf("[kv:%v]start SendMsgToRaft: startAt:%+v, msg:%+v\n", kv.me, startAt, msg)
+	index, _, isLeader := kv.rf.Start(msg.Command)
 	if !isLeader {
-		msg.ReplyChan <- &SendMsgReply{
+		msg.ResChan <- &SendMsgResult{
 			Valid: false,
 		}
 	} else {
 		msg.ExpCmtIdx = index
 		kv.PendingQChan <- msg
 	}
-	DPrintf("[kv:%v]done handling SendMsgTask: msg.Args%+v\n", kv.me, msg.Args)
+	DPrintf("[kv:%v]done SendMsgToRaft: startAt:%+v, index:%+v, isLeader:%+v\n", kv.me, startAt, index, isLeader)
 }
 
 func (kv *KVServer) StartKVThread() {
@@ -227,18 +215,23 @@ func (kv *KVServer) StartKVThread() {
 		DPrintf("[kv:%v]start of for loop kv:%+v\n", kv.me, kv)
 		select {
 		case SendMsg := <-kv.SendMsgChan:
-			DPrintf("[kv:%v]start handling SendMsg SendMsg:%+v, kv:%+v\n", kv.me, SendMsg.Args, kv)
-			if lastReqId, ok := kv.LastAppliedReq[SendMsg.Args.Command.ClientId]; ok && lastReqId == SendMsg.Args.Command.ReqId {
-				SendMsg.ReplyChan <- &SendMsgReply{
+			DPrintf("[kv:%v] received SendMsg: SendMsg:%+v\n", kv.me, SendMsg)
+			// since each request from client is sending serialize(it must complete one before send the next one for the same client)
+			// it is okay to check lastReq only to see new rquest is the same as last ReqId or not
+			if lastReqId, ok := kv.LastAppliedReq[SendMsg.Command.ClientId]; ok && lastReqId == SendMsg.Command.ReqId {
+				SendMsg.ResChan <- &SendMsgResult{
 					Valid: true,
-					Value: kv.State[SendMsg.Args.Command.Key],
+					Value: kv.State[SendMsg.Command.Key],
 				}
 			} else {
-				go kv.SendMsgTask(SendMsg)
+				// if this Msg is new request, we need to open up a new routine to push this
+				// to raft instance and push into KV pendingQ, the purpose of pendingQ is to
+				// know which client Requst to reply once it is commited by Raft instance
+				go kv.SendMsgToRaft(SendMsg)
 			}
-			DPrintf("[kv:%v]done handling SendMsg SendMsg:%+v, kv:%+v\n", kv.me, SendMsg.Args, kv)
+			DPrintf("[kv:%v]done handling SendMsg SendMsg:%+v, kv:%+v\n", kv.me, SendMsg, kv)
 		case applyCh := <-kv.applyCh:
-			DPrintf("[kv:%v]start handling applyCh applyCh:%+v, kv:%+v\n", kv.me, applyCh, kv)
+			DPrintf("[kv:%v]received applyCh: applyCh:%+v\n", kv.me, applyCh)
 			// only need to touch state when opCode is PUT, do nothing for GET
 			//var op Op
 			op := applyCh.Command.(Op)
@@ -252,18 +245,19 @@ func (kv *KVServer) StartKVThread() {
 			kv.LastAppliedReq[op.ClientId] = op.ReqId
 			// if there is pending item, we need to reply it
 			if msg, ok := kv.PendingQ[applyCh.CommandIndex]; ok {
-				if msg.Args.Command.ReqId != op.ReqId {
+				if msg.Command.ReqId != op.ReqId {
 					// seems like it might be the case like KV:0 is leader in the beginning, and those are not committed
 					// then partition down, later go out of partition and those cmdIdx are changed to different reqId
 					//panic(fmt.Sprintf("[KV:%v][applyCh] reqId not matching! %v != %v!\n", kv.me, msg.Args.Command.ReqId, op.ReqId))
 				} else {
-					reply := &SendMsgReply{
+					res := &SendMsgResult{
 						Valid: true,
 						Value: kv.State[op.Key],
 					}
-					go func(msg SendMsg, reply *SendMsgReply) {
-						msg.ReplyChan <- reply
-					}(msg, reply)
+					// todo : to make it blocking call?
+					go func(args *SendMsgArgs, res *SendMsgResult) {
+						args.ResChan <- res
+					}(msg, res)
 					// msg.ReplyChan <- &SendMsgReply{
 					// 	Valid: true,
 					// 	Value: kv.State[op.Key],
@@ -273,11 +267,16 @@ func (kv *KVServer) StartKVThread() {
 			}
 			DPrintf("[kv:%v]done handling applyCh applyCh:%+v, kv:%+v\n", kv.me, applyCh, kv)
 		case msg := <-kv.PendingQChan:
+			DPrintf("[kv:%v]received PendingQChan: msg:%+v\n", kv.me, msg)
 			kv.PendingQ[msg.ExpCmtIdx] = msg
+		case <-kv.ToStopChan:
+			DPrintf("[kv:%v]received ToStopChan\n", kv.me)
+			kv.ToStop = true
 		}
 		if kv.ToStop {
 			return
 		}
+		DPrintf("[kv:%v]end of for loop kv:%+v\n", kv.me, kv)
 	}
 }
 
@@ -311,10 +310,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.Uuid = time.Now().Unix()
-	kv.PendingQ = make(map[int]SendMsg)
+	kv.PendingQ = make(map[int]*SendMsgArgs)
 	kv.LastAppliedReq = make(map[int64]int64)
-	kv.SendMsgChan = make(chan SendMsg)
-	kv.PendingQChan = make(chan SendMsg)
+	kv.SendMsgChan = make(chan *SendMsgArgs)
+	kv.PendingQChan = make(chan *SendMsgArgs)
 	kv.State = make(map[string]string)
 	kv.ToStopChan = make(chan bool)
 	kv.ToStop = false

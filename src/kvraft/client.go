@@ -66,11 +66,11 @@ func (ck *Clerk) Get(key string) string {
 	ok := false
 	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
 		reply := GetReply{}
-		DPrintf("[CK:%v][Get]: ->%v, args:%+v\n", ck.Uuid, i, args)
+		// DPrintf("[CK:%v][Get]: ->%v, args:%+v\n", ck.Uuid, i, args)
 		ok = ck.servers[i].Call("KVServer.Get", &args, &reply)
 		if ok && !reply.WrongLeader {
-			if reply.ClientId != args.ClientId {
-				panic(fmt.Sprintf("[CK:%v][Get] ClientId not matching! %v != %v!\n", ck.Uuid, args.ClientId, reply.ClientId))
+			if reply.ClientId != args.ClientId || reply.ReqId != args.ReqId {
+				panic(fmt.Sprintf("[CK:%v][Get] args and reply data not matching!\n", ck.Uuid, args, reply))
 			}
 			ck.lastLeader = i
 			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
@@ -103,18 +103,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ok := false
 	for i := ck.lastLeader; ; i = (i + 1) % len(ck.servers) {
 		reply := PutAppendReply{}
-		DPrintf("[CK:%v][PutAppend]: ->%v ,args:%+v\n", ck.Uuid, i, args)
+		// DPrintf("[CK:%v][PutAppend]: ->%v ,args:%+v\n", ck.Uuid, i, args)
 		ok = ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 		if ok && !reply.WrongLeader {
 			DPrintf("[CK:%v][PutAppend]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
-			if reply.ClientId != args.ClientId {
-				panic(fmt.Sprintf("[CK:%v][PutAppend] ClientId not matching! %v != %v!\n", ck.Uuid, args.ClientId, reply.ClientId))
+			if reply.ClientId != args.ClientId || reply.ReqId != args.ReqId {
+				panic(fmt.Sprintf("[CK:%v][PutAppend] args and reply data not matching!\n", ck.Uuid, args, reply))
 			}
 			ck.lastLeader = i
-			break
+			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
+			return
 		}
 	}
-	DPrintf("[CK:%v][PutAppend]: done ReqId:%+v\n", ck.Uuid, args.ReqId)
 }
 
 func (ck *Clerk) Put(key string, value string) {
