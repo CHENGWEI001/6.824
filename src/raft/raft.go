@@ -24,7 +24,7 @@ import "math/rand"
 import "fmt"
 
 //import "log"
-import "math"
+// import "math"
 
 import "bytes"
 import "labgob"
@@ -117,6 +117,7 @@ type RaftState string
 type LogEntry struct {
 	Term    int         // term of the given log entry
 	Command interface{} // command for state machine
+	Index   int         // index of this logEntry in log
 }
 
 // RaftPersistence is persisted to the `persister`, and contains all necessary data to restart a failed node
@@ -244,13 +245,15 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int   // current term , for leader to update itself
-	Success   bool  // [ToDo]
-	FromId    int   // indicating this reply is from which raft instance
-	NextIndex int   // if success: nextIndex for this follower, if failure: next Index to try
-	VotedFor  int   // Replay current votedFor for the raft Instace
-	TimeStamp int64 // time this req sent
-	IsValid   bool  // to indidate if sender can ignore this Reply, this is to handle out of order AppendEntry case
+	Term                   int   // current term , for leader to update itself
+	Success                bool  // [ToDo]
+	FromId                 int   // indicating this reply is from which raft instance
+	NextIndex              int   // if success: nextIndex for this follower, if failure: next Index to try
+	VotedFor               int   // Replay current votedFor for the raft Instace
+	TimeStamp              int64 // time this req sent
+	IsValid                bool  // to indidate if sender can ignore this Reply, this is to handle out of order AppendEntry case
+	ConflictTerm           int   // follower conflicting term
+	ConflictTermFirstIndex int   // follower's first index of conflicting term
 }
 
 type ApplychArgs struct {
@@ -403,6 +406,7 @@ func (rf *Raft) StartHelper(req *StartReq) {
 		rf.Log = append(rf.Log, LogEntry{
 			Term:    rf.CurrentTerm,
 			Command: req.command,
+			Index:   len(rf.Log),
 		})
 		rf.MatchIndex[rf.me] = len(rf.Log) - 1
 		rf.NextIndex[rf.me] = len(rf.Log)
@@ -420,6 +424,43 @@ func (rf *Raft) Lock() {
 
 func (rf *Raft) Unlock() {
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) binarySearchForTerm(LogEntries []LogEntry, start int, end int, tgtTerm int, searchForFirst bool) int {
+	if start < 0 || start >= len(LogEntries) || end < 0 || end >= len(LogEntries) {
+		panic(fmt.Sprintf("[rf:%v]binarySearchForTerm: invalid input! start:%+v, end:%+v\n", rf.me, start, end))
+	}
+	lo := start
+	hi := end
+	for lo+1 < hi {
+		mi := lo + (hi-lo)/2
+		if LogEntries[mi].Term < tgtTerm {
+			lo = mi + 1
+		} else if LogEntries[mi].Term > tgtTerm {
+			hi = mi - 1
+		} else {
+			if searchForFirst {
+				hi = mi
+			} else {
+				lo = mi
+			}
+		}
+	}
+	if LogEntries[lo].Term != tgtTerm && LogEntries[hi].Term != tgtTerm {
+		return -1
+	}
+	if searchForFirst {
+		if LogEntries[lo].Term == tgtTerm {
+			return lo
+		} else {
+			return hi
+		}
+	}
+	if LogEntries[hi].Term == tgtTerm {
+		return hi
+	} else {
+		return lo
+	}
 }
 
 //
@@ -574,10 +615,10 @@ func (rf *Raft) startRaftOneTimeWorkerThread(id int, msg interface{}, term int, 
 	case AppendEntriesWorkerReq:
 		if appendEntriesWorkerReq, ok := msg.(AppendEntriesWorkerReq); ok {
 			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), to handle appendEntriesWorkerReq args:%+v\n",
-				rf.me, id, term, state, appendEntriesWorkerReq.args)
+				rf.me, id, term, state, startAt, appendEntriesWorkerReq.args)
 			reply := AppendEntriesReply{}
 			ok := rf.sendAppendEntries(id, appendEntriesWorkerReq.args, &reply)
-			if ok {
+			if ok && reply.IsValid {
 				appendEntriesWorkerReq.replyChan <- &reply
 			}
 			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), done handle appendEntriesWorkerReq ok:%+v, reply:%+v\n",
@@ -663,6 +704,9 @@ func (rf *Raft) sendApplyMsg(start int, end int) {
 		return
 	}
 	for i := start; i <= end; i++ {
+		if rf.Log[i].Index != i {
+			panic(fmt.Sprintf("[%v][sendApplyMsg] rf.Log[%v].Index:%v != i:%v rf:%+v", rf.me, i, rf.Log[i].Index, i, rf))
+		}
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.Log[i].Command,
@@ -722,18 +766,21 @@ func followerHandler(rf *Raft) {
 			rf.persist()
 			// if grant vote for a leader, reset timer
 			if rspVote.VoteGranted {
-				return
+				// return
+				timer = time.After(getRandElectionTimeoutMiliSecond())
 			}
 		case reqAppend := <-rf.AppendEntriesArgsChan:
-			DPrintf("[%v][followerHandler] received reqAppend:%+v", rf.me, reqAppend)
+			DPrintf("[%v][followerHandler] received reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, lastAppendEntryReq)
 			rspAppend := AppendEntriesReply{
-				Term:      rf.CurrentTerm,
-				Success:   false,
-				FromId:    rf.me,
-				NextIndex: reqAppend.PrevLogIndex + 1,
-				VotedFor:  rf.VotedFor,
-				TimeStamp: time.Now().UnixNano(),
-				IsValid:   true,
+				Term:                   rf.CurrentTerm,
+				Success:                false,
+				FromId:                 rf.me,
+				NextIndex:              reqAppend.PrevLogIndex + 1,
+				VotedFor:               rf.VotedFor,
+				TimeStamp:              time.Now().UnixNano(),
+				IsValid:                true,
+				ConflictTerm:           -1,
+				ConflictTermFirstIndex: -1,
 			}
 			// per Fig2 rule when receiving higher term
 			if reqAppend.Term > rf.CurrentTerm {
@@ -755,17 +802,29 @@ func followerHandler(rf *Raft) {
 					rf.Log = append(rf.Log[:reqAppend.PrevLogIndex+1], reqAppend.Entries...)
 					if reqAppend.LeaderCommit > rf.CommitIndex {
 						oldCommitIndex := rf.CommitIndex
-						rf.CommitIndex = int(math.Min(float64(reqAppend.LeaderCommit), float64(len(rf.Log)-1)))
+						// rf.CommitIndex = int(math.Min(float64(reqAppend.LeaderCommit), float64(len(rf.Log)-1)))
+						rf.CommitIndex = min(reqAppend.LeaderCommit, len(rf.Log)-1)
 						rf.sendApplyMsg(oldCommitIndex+1, rf.CommitIndex)
 					}
 					rspAppend.NextIndex = len(rf.Log)
 					rspAppend.Success = true
 				} else {
-					nextIdx := int(math.Min(float64(reqAppend.PrevLogIndex), float64(len(rf.Log))))
+					// nextIdx := int(math.Min(float64(reqAppend.PrevLogIndex), float64(len(rf.Log))))
+					nextIdx := min(reqAppend.PrevLogIndex+1, len(rf.Log))
 					// since log idx 0 is already done, just need to try up to 2
-					for ; nextIdx > 1; nextIdx-- {
-						if rf.Log[nextIdx-1].Term == reqAppend.PrevLogTerm {
-							break
+					// for ; nextIdx > 1; nextIdx-- {
+					// 	if rf.Log[nextIdx-1].Term == reqAppend.PrevLogTerm {
+					// 		break
+					// 	}
+					// }
+					// if we have conflict term, search for first index that has leader prevLogTerm
+					// this rule is per https://pdos.csail.mit.edu/6.824/notes/l-raft2.txt
+					if rf.Log[nextIdx-1].Term != reqAppend.PrevLogTerm {
+						rspAppend.ConflictTerm = rf.Log[nextIdx-1].Term
+						// try to find first index of conflict term
+						rspAppend.ConflictTermFirstIndex = rf.binarySearchForTerm(rf.Log, 0, nextIdx-1, rspAppend.ConflictTerm, true)
+						if rspAppend.ConflictTermFirstIndex == -1 {
+							panic(fmt.Sprintf("[%v][followerHandler] can't find conflict term:%v in its log in (%v, %v)", rf.me, rspAppend.ConflictTerm, 0, nextIdx-1))
 						}
 					}
 					rspAppend.NextIndex = nextIdx
@@ -777,7 +836,8 @@ func followerHandler(rf *Raft) {
 			// if ack an Append RPC, reset timer
 			if rspAppend.Success || rf.VotedFor == reqAppend.LeadId {
 				rf.persist()
-				return
+				// return
+				timer = time.After(getRandElectionTimeoutMiliSecond())
 			}
 		case <-rf.ToStopChan:
 			DPrintf("[%v][followerHandler] received ToStopChan", rf.me)
@@ -919,6 +979,9 @@ func (rf *Raft) redirectAppendHelper(reqVote *AppendEntriesArgs) {
 // helper to prepare appendEntries and send out reqeust ,
 // this API should only be called in raft instance thread
 func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *AppendEntriesReply) {
+	if rf.NextIndex[destServer]-1 < 0 || rf.NextIndex[destServer]-1 >= len(rf.Log) {
+		panic(fmt.Sprintf("[%v][appendEntriesHelper] (rf.NextIndex[%v]-1):%v is out of bound, rf:%+v", rf.me, destServer, rf.NextIndex[destServer]-1, rf))
+	}
 	argvs := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeadId:       rf.me,
@@ -1055,7 +1118,7 @@ func leaderHandler(rf *Raft) {
 			}
 			rf.AppendEntriesReplyChan <- &rspAppend
 		case appendReply := <-appendReplyChan:
-			DPrintf("[%v][leaderHandler] received appendReply:%+v", rf.me, appendReply)
+			DPrintf("[%v][leaderHandler] received appendReply:%+v, lastAppendReqly[%v]:%+v", rf.me, appendReply, appendReply.FromId, lastAppendReqly[appendReply.FromId])
 			if lastAppendReqly[appendReply.FromId] != nil && lastAppendReqly[appendReply.FromId].TimeStamp >= appendReply.TimeStamp {
 				DPrintf("[%v][leaderHandler] received older appendReply:%+v, lastAppendReqly:%+v", rf.me, appendReply, *lastAppendReqly[appendReply.FromId])
 				continue
@@ -1077,7 +1140,26 @@ func leaderHandler(rf *Raft) {
 				// if fail, follower tell leader from where to try is better,
 				// ignore the rsp if this follower is not voting to it
 				if appendReply.VotedFor == rf.me {
-					rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
+					// rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
+					// per https://pdos.csail.mit.edu/6.824/notes/l-raft2.txt rule
+					// but the one differene is that, I choose to use if Leader has the conflict term entry,
+					// which means we can use that entry as prevIdex, so set nextIndex to that found conflict entry index + 1
+					if appendReply.ConflictTerm != -1 {
+						lastConflictTermEntryIndex := rf.binarySearchForTerm(rf.Log, 0, len(rf.Log)-1, appendReply.ConflictTerm, false)
+						if lastConflictTermEntryIndex != -1 {
+							rf.NextIndex[appendReply.FromId] = lastConflictTermEntryIndex + 1
+						} else {
+							rf.NextIndex[appendReply.FromId] = appendReply.ConflictTermFirstIndex
+						}
+					} else {
+						rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
+					}
+					// make sure NextIndex should always bigger than current MatchIndex
+					if rf.NextIndex[appendReply.FromId] < rf.MatchIndex[appendReply.FromId] {
+						panic(fmt.Sprintf("[%v][leaderHandler] MatchIdex:%v is higher than NextIndex:%v, it is unexpected!",
+							rf.me, rf.MatchIndex[appendReply.FromId], rf.NextIndex[appendReply.FromId]))
+					}
+					rf.NextIndex[appendReply.FromId] = max(rf.NextIndex[appendReply.FromId], rf.MatchIndex[appendReply.FromId])
 					rf.appendEntriesHelper(appendReply.FromId, appendReplyChan)
 				}
 			}
