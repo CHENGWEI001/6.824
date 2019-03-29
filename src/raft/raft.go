@@ -808,6 +808,8 @@ func followerHandler(rf *Raft) {
 					}
 					rspAppend.NextIndex = len(rf.Log)
 					rspAppend.Success = true
+					// save to persist when follower successfully append new Entry from leader
+					rf.persist()
 				} else {
 					// nextIdx := int(math.Min(float64(reqAppend.PrevLogIndex), float64(len(rf.Log))))
 					nextIdx := min(reqAppend.PrevLogIndex+1, len(rf.Log))
@@ -835,7 +837,6 @@ func followerHandler(rf *Raft) {
 			rf.AppendEntriesReplyChan <- &rspAppend
 			// if ack an Append RPC, reset timer
 			if rspAppend.Success || rf.VotedFor == reqAppend.LeadId {
-				rf.persist()
 				// return
 				timer = time.After(getRandElectionTimeoutMiliSecond())
 			}
