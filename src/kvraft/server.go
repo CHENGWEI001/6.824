@@ -9,8 +9,12 @@ import (
 	"sync"
 	"time"
 )
+import "bytes"
 
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
+const SnapshotSizeTolerancePercentage = 5
+const SnapShotCheckIntervalMillisecond = 50 * time.Millisecond
+const SendMsgTaskMaxWaitLimit = 20000 * time.Millisecond
 const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -67,14 +71,21 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	Uuid           int64
-	LastAppliedReq map[int64]int64      // to store last requestId from each client, here assume one client would send one reuqest at a time
-	PendingQ       map[int]*SendMsgArgs // to store cmd send to RAFT but not yet complete
-	SendMsgChan    chan *SendMsgArgs    // channel for receiving new msg from client
+	Uuid                   int64
+	LastAppliedReq         map[int64]int64      // to store last requestId from each client, here assume one client would send one reuqest at a time
+	PendingQ               map[int]*SendMsgArgs // to store cmd send to RAFT but not yet complete
+	SendMsgChan            chan *SendMsgArgs    // channel for receiving new msg from client
+	State                  map[string]string
+	ToStopChan             chan bool         // channel for stopping the raft instance thread
+	ToStop                 bool              // indicator for stopping raft instance
+	AddToPendingQChan      chan *SendMsgArgs // channel for add item into PendingQ
+	RemoveFromPendingQChan chan *SendMsgArgs // channel for remove item from PendingQ
+	persister              *raft.Persister   // persister
+}
+
+type KVRaftPersistence struct {
+	LastAppliedReq map[int64]int64
 	State          map[string]string
-	ToStopChan     chan bool         // channel for stopping the raft instance thread
-	ToStop         bool              // indicator for stopping raft instance
-	PendingQChan   chan *SendMsgArgs // channel for add item into PendingQ
 }
 
 // the worker handler to send new request msg to KV raft main thread
@@ -82,6 +93,7 @@ func (kv *KVServer) SendMsgTask(args *SendMsgArgs, reply *SendMsgReply) {
 	startAt := time.Now().UnixNano()
 	DPrintf("[kv:%v]start SendMsgTask: startAt:%+v, args%+v\n", kv.me, startAt, args)
 	timer := time.After(0)
+	// 	timeOutTimer := time.After(SendMsgTaskMaxWaitLimit)
 	msgSent := false
 	// whenever Reply return with valid, kv.State should already been updated with latest
 	for {
@@ -99,11 +111,19 @@ func (kv *KVServer) SendMsgTask(args *SendMsgArgs, reply *SendMsgReply) {
 				goto End
 			}
 			if !msgSent {
-				args.ResChan = make(chan *SendMsgResult)
+				// make buffered channel to prevent dead lock for below scenario
+				// kv received sendMsg and call sendMsgToRaft, it call rf.start()
+				// when rf.start is done, it will try to send to reply chan make here
+				// but due to in this sendMsgTask API, it will change resChan every interval,
+				// the old reschan won't have handler to take it, cause KV thread stuck
+				args.ResChan = make(chan *SendMsgResult, 2)
 				kv.SendMsgChan <- args
 				msgSent = true
 			}
 			timer = time.After(AwaitLeaderCheckInterval)
+			// 		case <-timeOutTimer:
+			// 			panic(fmt.Sprintf("[kv:%v]start SendMsgTask: startAt:%+v, args%+v not complete in %+v, now:%+v\n",
+			// 				kv.me, startAt, args, SendMsgTaskMaxWaitLimit, time.Now()))
 		}
 	}
 End:
@@ -112,10 +132,13 @@ End:
 		if !msgSent {
 			reply.Err = Err(fmt.Sprintf("[kv:%v] is not leader\n", kv.me))
 		} else {
+			// don't remove from pendingQ, test easier get stuck if do this
+			// I am guessing it might remove wrong item
+			// 			kv.RemoveFromPendingQChan <- args
 			reply.Err = Err(fmt.Sprintf("[kv:%v] was leader not anymore\n", kv.me))
 		}
 	}
-	reply.Err = Err(fmt.Sprintf("[kv:%v] OK\n", kv.me))
+	reply.Err = Err(fmt.Sprintf("[kv:%v] OK", kv.me))
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -128,6 +151,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			ReqId:    args.ReqId,
 			ClientId: args.ClientId,
 		},
+		ResChan:   nil,
+		ExpCmtIdx: -1,
 	}
 	r := SendMsgReply{}
 	kv.SendMsgTask(&s, &r)
@@ -135,6 +160,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.ReqId = r.ReqId
 	reply.Value = r.Value
 	reply.ClientId = r.ClientId
+	reply.Err = r.Err
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -162,6 +188,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.WrongLeader = r.WrongLeader
 	reply.ReqId = r.ReqId
 	reply.ClientId = r.ClientId
+	reply.Err = r.Err
 }
 
 //
@@ -194,7 +221,24 @@ func (kv *KVServer) Unlock() {
 // 	kv.Unock()
 // }
 
+func (kv *KVServer) createSnapshot() {
+	DPrintf("[kv:%v]start createSnapshot: RaftStateSize:%v\n", kv.me, kv.persister.RaftStateSize())
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(KVRaftPersistence{
+		State:          kv.State,
+		LastAppliedReq: kv.LastAppliedReq,
+	})
+	data := w.Bytes()
+	// toDo : call RF compact log functin to store state and snapshot
+	DPrintf("[kv:%v]done createSnapshot: RaftStateSize:%v, data:%+v\n", kv.me, kv.persister.RaftStateSize(), data)
+}
+
 func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
+	// the reason here we need to use lock is to have atomic operation for :
+	// rf.start() then adding to pendingQ, if not , we might have potential issue that item add to
+	// rf log and complete applych , but pendingQ not yet go into pendingQ
+	// 	kv.Lock()
 	startAt := time.Now().UnixNano()
 	DPrintf("[kv:%v]start SendMsgToRaft: startAt:%+v, msg:%+v\n", kv.me, startAt, msg)
 	index, _, isLeader := kv.rf.Start(msg.Command)
@@ -204,13 +248,16 @@ func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
 		}
 	} else {
 		msg.ExpCmtIdx = index
-		kv.PendingQChan <- msg
+		// 		kv.AddToPendingQChan <- msg
+		kv.PendingQ[msg.ExpCmtIdx] = msg
 	}
 	DPrintf("[kv:%v]done SendMsgToRaft: startAt:%+v, index:%+v, isLeader:%+v\n", kv.me, startAt, index, isLeader)
+	//kv.Unlock()
 }
 
 func (kv *KVServer) StartKVThread() {
 	defer DPrintf("[kv:%v]End of Thread: %+v\n", kv.me, kv)
+	// 	snapShotCheckTimer := time.After(SnapShotCheckIntervalMillisecond)
 	for {
 		DPrintf("[kv:%v]start of for loop kv:%+v\n", kv.me, kv)
 		select {
@@ -227,11 +274,13 @@ func (kv *KVServer) StartKVThread() {
 				// if this Msg is new request, we need to open up a new routine to push this
 				// to raft instance and push into KV pendingQ, the purpose of pendingQ is to
 				// know which client Requst to reply once it is commited by Raft instance
-				go kv.SendMsgToRaft(SendMsg)
+				// go kv.SendMsgToRaft(SendMsg)
+				kv.SendMsgToRaft(SendMsg)
 			}
 			DPrintf("[kv:%v]done handling SendMsg SendMsg:%+v, kv:%+v\n", kv.me, SendMsg, kv)
 		case applyCh := <-kv.applyCh:
 			DPrintf("[kv:%v]received applyCh: applyCh:%+v\n", kv.me, applyCh)
+			// 			kv.Lock()
 			// only need to touch state when opCode is PUT, do nothing for GET
 			//var op Op
 			op := applyCh.Command.(Op)
@@ -265,13 +314,24 @@ func (kv *KVServer) StartKVThread() {
 				}
 				delete(kv.PendingQ, applyCh.CommandIndex)
 			}
+			// 			kv.Unlock()
 			DPrintf("[kv:%v]done handling applyCh applyCh:%+v, kv:%+v\n", kv.me, applyCh, kv)
-		case msg := <-kv.PendingQChan:
-			DPrintf("[kv:%v]received PendingQChan: msg:%+v\n", kv.me, msg)
+		case msg := <-kv.AddToPendingQChan:
+			DPrintf("[kv:%v]received AddToPendingQChan: msg:%+v\n", kv.me, msg)
 			kv.PendingQ[msg.ExpCmtIdx] = msg
+		case msg := <-kv.RemoveFromPendingQChan:
+			DPrintf("[kv:%v]received RemoveFromPendingQChan: msg:%+v\n", kv.me, msg)
+			// https://stackoverflow.com/questions/1736014/delete-mapkey-in-go
+			delete(kv.PendingQ, msg.ExpCmtIdx)
 		case <-kv.ToStopChan:
 			DPrintf("[kv:%v]received ToStopChan\n", kv.me)
 			kv.ToStop = true
+			// 		case <-snapShotCheckTimer:
+			// 			DPrintf("[kv:%v]snapShotCheckTimer is up: RaftStateSize:%v, maxraftstate:%v\n",
+			// 				kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
+			// 			if (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
+			// 				kv.createSnapshot()
+			// 			}
 		}
 		if kv.ToStop {
 			return
@@ -313,10 +373,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.PendingQ = make(map[int]*SendMsgArgs)
 	kv.LastAppliedReq = make(map[int64]int64)
 	kv.SendMsgChan = make(chan *SendMsgArgs)
-	kv.PendingQChan = make(chan *SendMsgArgs)
+	kv.AddToPendingQChan = make(chan *SendMsgArgs)
+	kv.RemoveFromPendingQChan = make(chan *SendMsgArgs)
 	kv.State = make(map[string]string)
 	kv.ToStopChan = make(chan bool)
 	kv.ToStop = false
+	kv.persister = persister
+	kv.maxraftstate = maxraftstate
 
 	go kv.StartKVThread()
 	return kv

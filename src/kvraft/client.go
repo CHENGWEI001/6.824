@@ -4,6 +4,7 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 import "fmt"
+import "time"
 
 // import "time"
 // import "log"
@@ -15,6 +16,8 @@ import "fmt"
 // const REQID_CLIENTID_MASK = 0x3FF000
 // const REQID_RANDID_SHIFT = 0
 // const REQID_RANDID_MASK = 0xFFF
+
+const CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT_MILLISECOND = 20000 * time.Millisecond
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -57,7 +60,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	DPrintf("[CK:%v][Get]: key:%v\n", ck.Uuid, key)
+	startAt := time.Now()
+	DPrintf("[CK:%v][Get]: key:%v, startAt:%+v\n", ck.Uuid, key, startAt)
 	args := GetArgs{
 		Key:      key,
 		ReqId:    nrand(),
@@ -76,6 +80,10 @@ func (ck *Clerk) Get(key string) string {
 			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
 			return reply.Value
 		}
+		if time.Now().Sub(startAt) > CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT_MILLISECOND {
+			panic(fmt.Sprintf("[CK:%v][Get]: key:%v, startAt:%+v not complete in %+v milliseconds, now:%+v\n",
+				ck.Uuid, key, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT_MILLISECOND, time.Now()))
+		}
 	}
 
 }
@@ -91,7 +99,8 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	DPrintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v\n", ck.Uuid, key, value, op)
+	startAt := time.Now()
+	DPrintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v, startAt:%+v\n", ck.Uuid, key, value, op, startAt)
 
 	args := PutAppendArgs{
 		Key:      key,
@@ -113,6 +122,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.lastLeader = i
 			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
 			return
+		}
+		if time.Now().Sub(startAt) > CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT_MILLISECOND {
+			panic(fmt.Sprintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v, startAt:%+v not complete in %+v milliseconds, now:%+v\n",
+				ck.Uuid, key, value, op, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT_MILLISECOND, time.Now()))
 		}
 	}
 }
