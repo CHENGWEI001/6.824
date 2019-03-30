@@ -53,7 +53,7 @@ type ApplyMsg struct {
 const ELECTION_TIMEOUT_MILISECONDS = 500
 const ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS = 500
 const HEARTBEAT_TIMEOUT_MILISECONDS = 200
-const LEADER_PEER_TICK_MILISECONDS = 200
+const LEADER_PEER_TICK_MILISECONDS = 10
 const INITIAL_VOTED_FOR = -1
 
 type Raft struct {
@@ -794,6 +794,8 @@ func followerHandler(rf *Raft) {
 					DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, *lastAppendEntryReq)
 					rspAppend.IsValid = false
 					rf.AppendEntriesReplyChan <- &rspAppend
+					// do I need to reset election timer here? but since it is older request, I think we should not reset it
+					// timer = time.After(getRandElectionTimeoutMiliSecond())
 					continue
 				}
 				lastAppendEntryReq = reqAppend
@@ -843,6 +845,7 @@ func followerHandler(rf *Raft) {
 		case <-rf.ToStopChan:
 			DPrintf("[%v][followerHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
+			return
 		case <-rf.GetStateReqChan:
 			DPrintf("[%v][followerHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
@@ -957,6 +960,7 @@ func candidateHandler(rf *Raft) {
 		case <-rf.ToStopChan:
 			DPrintf("[%v][candidateHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
+			return
 		case <-rf.GetStateReqChan:
 			DPrintf("[%v][candidateHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
@@ -992,8 +996,8 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 		TimeStamp:    time.Now().UnixNano(),
 	}
 	tmpLog := rf.Log[rf.NextIndex[destServer]:len(rf.Log)]
-	//if we don't have any new entry and now over heartbeat interval, don't sent the RPC
-	if len(tmpLog) == 0 && time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
+	// don't need to send the appendEntry if the interval from last sent smaller than heartbeat interval
+	if time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
 		return
 	}
 	argvs.Entries = make([]LogEntry, len(tmpLog))
@@ -1167,6 +1171,7 @@ func leaderHandler(rf *Raft) {
 		case <-rf.ToStopChan:
 			DPrintf("[%v][leaderHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
+			return
 		case <-rf.GetStateReqChan:
 			DPrintf("[%v][leaderHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
