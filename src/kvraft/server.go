@@ -81,6 +81,7 @@ type KVServer struct {
 	AddToPendingQChan      chan *SendMsgArgs // channel for add item into PendingQ
 	RemoveFromPendingQChan chan *SendMsgArgs // channel for remove item from PendingQ
 	persister              *raft.Persister   // persister
+	LastApplyMsg           *raft.ApplyMsg    // the last ApplyMsg
 }
 
 type KVRaftPersistence struct {
@@ -230,7 +231,7 @@ func (kv *KVServer) createSnapshot() {
 		LastAppliedReq: kv.LastAppliedReq,
 	})
 	data := w.Bytes()
-	// toDo : call RF compact log functin to store state and snapshot
+	kv.rf.CreateSnapshot(data, kv.LastApplyMsg)
 	DPrintf("[kv:%v]done createSnapshot: RaftStateSize:%v, data:%+v\n", kv.me, kv.persister.RaftStateSize(), data)
 }
 
@@ -281,6 +282,10 @@ func (kv *KVServer) StartKVThread() {
 		case applyCh := <-kv.applyCh:
 			DPrintf("[kv:%v]received applyCh: applyCh:%+v\n", kv.me, applyCh)
 			// 			kv.Lock()
+			if !applyCh.CommandValid {
+				kv.ReadSnapshot(kv.persister.ReadSnapshot())
+				continue
+			}
 			// only need to touch state when opCode is PUT, do nothing for GET
 			//var op Op
 			op := applyCh.Command.(Op)
@@ -292,6 +297,7 @@ func (kv *KVServer) StartKVThread() {
 				}
 			}
 			kv.LastAppliedReq[op.ClientId] = op.ReqId
+			kv.LastApplyMsg = &applyCh
 			// if there is pending item, we need to reply it
 			if msg, ok := kv.PendingQ[applyCh.CommandIndex]; ok {
 				if msg.Command.ReqId != op.ReqId {
@@ -340,6 +346,20 @@ func (kv *KVServer) StartKVThread() {
 	}
 }
 
+func (kv *KVServer) ReadSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var obj KVRaftPersistence
+	if d.Decode(&obj) != nil {
+		panic(fmt.Sprintf("[%v][LoadSnapshot] fail to read snapshot!\n", kv.me))
+	}
+	kv.LastAppliedReq = obj.LastAppliedReq
+	kv.State = obj.State
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -380,6 +400,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.ToStop = false
 	kv.persister = persister
 	kv.maxraftstate = maxraftstate
+	kv.ReadSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.StartKVThread()
 	return kv

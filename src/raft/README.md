@@ -1,3 +1,11 @@
+# ToDo
+* below test case sometimes failure:
+```
+Test (2C): Figure 8 (unreliable) ...
+--- FAIL: TestFigure8Unreliable2C (44.25s)
+	config.go:471: one(1403) failed to reach agreement
+```
+
 # Steps
 ```
 GOPATH=/home/ec2-user/environment/6.824/

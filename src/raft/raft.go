@@ -91,6 +91,9 @@ type Raft struct {
 	LastAppendEntrySentTime []time.Time              // last time stamp sent appendEntry
 	SelfWorkerCloseChan     chan bool                // chan for closing self worker ( which is to handle applych)
 	SelfWorkerChan          chan interface{}         // channel to worker for sending ApplyMsg back to tester
+	SnapshotLastIndex       int                      // index of last log entry for the snapshot, init to -1
+	SnapshotLastTerm        int                      // term of last log entry for the snapshot
+	MsgChan                 chan interface{}         // channel for raft main thread to handle incoming request/msg
 }
 
 type GetStateReq struct {
@@ -111,6 +114,16 @@ type StartReply struct {
 	isLeader bool
 }
 
+type CreateSnapshotReq struct {
+	kvState      []byte
+	lastApplyMsg *ApplyMsg
+}
+
+type InstallSnapshotReq struct {
+	args      *InstallSnapshotArgs
+	replyChan chan *InstallSnapshotReply
+}
+
 // serverState indicating current raft instance state
 type RaftState string
 
@@ -122,11 +135,11 @@ type LogEntry struct {
 
 // RaftPersistence is persisted to the `persister`, and contains all necessary data to restart a failed node
 type RaftPersistence struct {
-	CurrentTerm int
-	Log         []LogEntry
-	VotedFor    int
-	// LastSnapshotIndex int
-	// LastSnapshotTerm  int
+	CurrentTerm       int
+	Log               []LogEntry
+	VotedFor          int
+	SnapshotLastIndex int
+	SnapshotLastTerm  int
 }
 
 const (
@@ -271,6 +284,27 @@ type RequestVoteWorkerReq struct {
 	replyChan chan *RequestVoteReply
 }
 
+type InstallSnapshotWorkerReq struct {
+	args      *InstallSnapshotArgs
+	replyChan chan *InstallSnapshotReply
+}
+
+type InstallSnapshotArgs struct {
+	Term              int    // leader's term
+	LeadId            int    // leader's id
+	LastIncludedIndex int    // last included index in the snapshot
+	LastIncludedTerm  int    // term of last included index of the snapshot
+	Data              []byte // raw bytes of the snapshot chunk
+	TimeStamp         int64  // time this req sent
+}
+
+type InstallSnapshotReply struct {
+	Term      int   // currentTerm for the follower for leader to update
+	FromId    int   // indicating this reply is from which raft instance
+	TimeStamp int64 // time this req sent
+	IsValid   bool  // to indidate if sender can ignore this Reply, this is to handle out of order case
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -288,6 +322,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.AppendEntriesArgsChan <- args
 	*reply = *(<-rf.AppendEntriesReplyChan)
 	DPrintf("[AppendEntries][%v <- %v]: %+v\n", args.LeadId, reply.FromId, *reply)
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	DPrintf("[InstallSnapshot][%v -> %v]: %+v\n", args.LeadId, rf.me, *args)
+	req := InstallSnapshotReq{
+		args:      args,
+		replyChan: make(chan *InstallSnapshotReply),
+	}
+	rf.MsgChan <- &req
+	*reply = *(<-req.replyChan)
+	DPrintf("[InstallSnapshot][%v <- %v]: %+v\n", args.LeadId, reply.FromId, *reply)
 }
 
 //
@@ -333,6 +378,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	DPrintf("[RPC][InstallSnapshot][%v -> %v]: args: %+v\n", args.LeadId, server, *args)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	DPrintf("[RPC][InstallSnapshot][%v <- %v]: ok: %v, reply: %+v\n", args.LeadId, server, ok, *reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -372,6 +424,13 @@ func (rf *Raft) Kill() {
 	}(rf)
 }
 
+func (rf *Raft) CreateSnapshot(kvState []byte, lastApplyMsg *ApplyMsg) {
+	rf.MsgChan <- &CreateSnapshotReq{
+		kvState:      kvState,
+		lastApplyMsg: lastApplyMsg,
+	}
+}
+
 func (rf *Raft) updateTerm(term int) {
 	// rf.Lock()
 	// defer rf.Unlock()
@@ -386,10 +445,11 @@ func (rf *Raft) updateState(state RaftState) {
 
 // init NextIndex and MatchIndex after every election
 func (rf *Raft) initIndex() {
+	lastIndex, _ := rf.getLastLogEntryInfo()
 	rf.NextIndex = make([]int, len(rf.peers))
 	rf.MatchIndex = make([]int, len(rf.peers))
 	for i := range rf.peers {
-		rf.NextIndex[i] = len(rf.Log)
+		rf.NextIndex[i] = lastIndex + 1
 	}
 
 }
@@ -406,16 +466,135 @@ func (rf *Raft) StartHelper(req *StartReq) {
 		rf.Log = append(rf.Log, LogEntry{
 			Term:    rf.CurrentTerm,
 			Command: req.command,
-			Index:   len(rf.Log),
+			Index:   rf.NextIndex[rf.me],
 		})
-		rf.MatchIndex[rf.me] = len(rf.Log) - 1
-		rf.NextIndex[rf.me] = len(rf.Log)
+		rf.MatchIndex[rf.me] = rf.NextIndex[rf.me]
+		rf.NextIndex[rf.me]++
 	}
 	rf.StartReplyChan <- &StartReply{
-		index:    len(rf.Log) - 1,
+		index:    rf.MatchIndex[rf.me],
 		term:     rf.CurrentTerm,
 		isLeader: rf.CurrentRaftState == leader,
 	}
+}
+
+func (rf *Raft) getLastLogEntryInfo() (index int, term int) {
+	if len(rf.Log) > 0 {
+		index = rf.Log[len(rf.Log)-1].Index
+		term = rf.Log[len(rf.Log)-1].Term
+	} else {
+		index = rf.SnapshotLastIndex
+		term = rf.SnapshotLastTerm
+	}
+	if index < 0 {
+		panic(fmt.Sprintf("[rf:%v] getLastLogEntryInfo: invalid index:%v! rf:%+v\n", rf.me, index, rf))
+	}
+	return
+}
+
+func (rf *Raft) getLogEntryIndexFromGlobalIndex(globalIndex int) (logEntryIndex int) {
+	logEntryIndex = globalIndex - rf.SnapshotLastIndex - 1
+	return
+}
+
+func (rf *Raft) getLogEntryInfo(globalIndex int) (index int, term int) {
+	logEntryIndex := rf.getLogEntryIndexFromGlobalIndex(globalIndex)
+	if logEntryIndex >= 0 && logEntryIndex < len(rf.Log) {
+		index = rf.Log[logEntryIndex].Index
+		term = rf.Log[logEntryIndex].Term
+	} else if logEntryIndex == -1 {
+		index = rf.SnapshotLastIndex
+		term = rf.SnapshotLastTerm
+	} else { // when we don't have any info for this index, already disgard due to snapshot
+		index = -1
+		term = 0
+	}
+	if index < -1 {
+		panic(fmt.Sprintf("[rf:%v] getPrevLogEntryInfo: invalid index:%v! logEntryIndex:%v, globalIndex:%v, rf:%+v\n",
+			rf.me, index, logEntryIndex, globalIndex, rf))
+	}
+	return
+}
+
+func (rf *Raft) EncodeState() (state []byte) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(RaftPersistence{
+		CurrentTerm:       rf.CurrentTerm,
+		VotedFor:          rf.VotedFor,
+		Log:               rf.Log,
+		SnapshotLastIndex: rf.SnapshotLastIndex,
+		SnapshotLastTerm:  rf.SnapshotLastTerm,
+	})
+	state = w.Bytes()
+	return
+}
+
+func (rf *Raft) createSnapshotHelper(req *CreateSnapshotReq) {
+	// prepare the data to store
+	rf.SnapshotLastIndex = req.lastApplyMsg.CommandIndex
+	rf.SnapshotLastTerm = rf.Log[rf.SnapshotLastIndex].Term
+	state := rf.EncodeState()
+	// save both rf state and kv state into persist snapshot
+	rf.persister.SaveStateAndSnapshot(state, req.kvState)
+
+	// cut off older log which is included in snapshot
+	rf.Log = rf.Log[rf.SnapshotLastIndex+1:]
+}
+
+func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
+	// per Fig2 rule when receiving higher term
+	if req.args.Term > rf.CurrentTerm {
+		rf.updateState(follower)
+		return
+	}
+	if req.args.Term < rf.CurrentTerm {
+		return
+	}
+	if req.args.LeadId == rf.VotedFor {
+		if rf.CurrentRaftState != follower {
+			panic(fmt.Sprintf("[%v][InstallSnapshotHelper] not expect go to this point under state:%v, rf:%+v",
+				rf.me, rf.CurrentRaftState, rf))
+		}
+		rf.SnapshotLastIndex = req.args.LastIncludedIndex
+		rf.SnapshotLastTerm = req.args.LastIncludedTerm
+		// cut off older log which is included in snapshot
+		rf.Log = rf.Log[rf.SnapshotLastIndex+1:]
+		state := rf.EncodeState()
+		rf.persister.SaveStateAndSnapshot(state, req.args.Data)
+		// ask self worker to send applymsg with update data from snapshot to KV peer
+		rf.SelfWorkerChan <- &ApplyMsg{
+			CommandValid: false, // send to false would mean KV to load snapshot
+		}
+	}
+}
+
+func (rf *Raft) MsgHandler(msg interface{}) {
+	switch msgType := msg.(type) {
+	case *CreateSnapshotReq:
+		if req, ok := msg.(*CreateSnapshotReq); ok {
+			DPrintf("[%v] MsgHandler: to handle CreateSnapshotReq:%+v\n",
+				rf.me, req)
+			rf.createSnapshotHelper(req)
+			DPrintf("[%v] MsgHandler: done handle CreateSnapshotReq:%+v\n",
+				rf.me, req)
+		} else {
+			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
+				rf.me, msgType, req))
+		}
+	case *InstallSnapshotReq:
+		if req, ok := msg.(*InstallSnapshotReq); ok {
+			DPrintf("[%v] MsgHandler: to handle InstallSnapshotReq:%+v\n",
+				rf.me, req)
+			rf.InstallSnapshotHelper(req)
+			DPrintf("[%v] MsgHandler: done handle InstallSnapshotReq:%+v\n",
+				rf.me, req)
+		} else {
+			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
+				rf.me, msgType, req))
+		}
+	}
+
 }
 
 func (rf *Raft) Lock() {
@@ -504,6 +683,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.PrevApplyMsgToken = make(chan int64)
 	rf.NextApplyMsgToken = make(chan int64)
 	rf.LastAppendEntrySentTime = make([]time.Time, len(peers))
+	rf.SnapshotLastIndex = -1
+	rf.SnapshotLastTerm = 0
+	rf.MsgChan = make(chan interface{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -555,8 +737,8 @@ func (rf *Raft) startRaftWorkerThread(id int, workerCloseChan chan bool, workerC
 					panic(fmt.Sprintf("[%v] Worker:(id:%v, term:%v, state:%v), can't handle msgType:%+v, msg:%+v\n",
 						rf.me, id, term, state, msgType, msg))
 				}
-			case AppendEntriesWorkerReq:
-				if appendEntriesWorkerReq, ok := msg.(AppendEntriesWorkerReq); ok {
+			case *AppendEntriesWorkerReq:
+				if appendEntriesWorkerReq, ok := msg.(*AppendEntriesWorkerReq); ok {
 					DPrintf("[%v] Worker:(id:%v, term:%v, state:%v), to handle appendEntriesWorkerReq args:%+v\n",
 						rf.me, id, term, state, appendEntriesWorkerReq.args)
 					reply := AppendEntriesReply{}
@@ -642,6 +824,21 @@ func (rf *Raft) startRaftOneTimeWorkerThread(id int, msg interface{}, term int, 
 			panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), can't handle msgType:%+v, msg:%+v\n",
 				rf.me, id, term, state, startAt, msgType, msg))
 		}
+	case InstallSnapshotWorkerReq:
+		if installSnapshotWorkerReq, ok := msg.(InstallSnapshotWorkerReq); ok {
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), to handle installSnapshotWorkerReq args:%+v\n",
+				rf.me, id, term, state, installSnapshotWorkerReq.args)
+			reply := InstallSnapshotReply{}
+			ok := rf.sendInstallSnapshot(id, installSnapshotWorkerReq.args, &reply)
+			if ok && reply.IsValid {
+				installSnapshotWorkerReq.replyChan <- &reply
+			}
+			DPrintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), done handle installSnapshotWorkerReq ok:%+v, reply:%+v\n",
+				rf.me, id, term, state, startAt, ok, reply)
+		} else {
+			panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), can't handle msgType:%+v, msg:%+v\n",
+				rf.me, id, term, state, startAt, msgType, msg))
+		}
 	default:
 		panic(fmt.Sprintf("[%v] One Time Worker:(id:%v, term:%v, state:%v, startAt:%+v), unexpected msgType:%+v, msg:%+v\n",
 			rf.me, id, term, state, startAt, msgType, msg))
@@ -683,34 +880,33 @@ func (rf *Raft) agreeVote(reqVote *RequestVoteArgs, rspVote *RequestVoteReply) b
 	if rf.VotedFor != INITIAL_VOTED_FOR && rf.VotedFor != reqVote.CandidateId {
 		return false
 	}
-	if reqVote.LastLogTerm == rf.Log[len(rf.Log)-1].Term {
-		return reqVote.LastLogIndex+1 >= len(rf.Log)
+	lastLogEntryIndex, lastLogEntryTerm := rf.getLastLogEntryInfo()
+	if reqVote.LastLogTerm == lastLogEntryTerm {
+		// if last log term is the same , see whose log entry is longer ( need to consider snapshot)
+		return reqVote.LastLogIndex >= lastLogEntryIndex
 	} else {
-		return reqVote.LastLogTerm > rf.Log[len(rf.Log)-1].Term
+		return reqVote.LastLogTerm > lastLogEntryTerm
 	}
-
-	// if reqVote.LastLogIndex < len(rf.Log) {
-	// 	if rf.Log[reqVote.LastLogIndex].Term == reqVote.LastLogTerm {
-	// 		return reqVote.LastLogIndex+1 >= len(rf.Log)
-	// 	} else {
-	// 		return rf.Log[reqVote.LastLogIndex].Term < reqVote.LastLogTerm
-	// 	}
-	// }
 	return true
 }
 
+// start and end are pos index in rf.Log
 func (rf *Raft) sendApplyMsg(start int, end int) {
+	if start < 0 || end >= len(rf.Log) {
+		panic(fmt.Sprintf("[%v][sendApplyMsg] start:%v, end:%v is out of bound rf:%+v",
+			rf.me, start, end, rf))
+	}
 	if start > end {
 		return
 	}
 	for i := start; i <= end; i++ {
-		if rf.Log[i].Index != i {
+		if rf.Log[i].Index != i+rf.SnapshotLastIndex+1 {
 			panic(fmt.Sprintf("[%v][sendApplyMsg] rf.Log[%v].Index:%v != i:%v rf:%+v", rf.me, i, rf.Log[i].Index, i, rf))
 		}
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.Log[i].Command,
-			CommandIndex: i,
+			CommandIndex: rf.Log[i].Index,
 		}
 		// go func(msg ApplyMsg, prevToken chan int64, nextToken chan int64) {
 		// 	// DPrintf("[%v]sendApplyMsg: %+v, %+v\n", rf.me, msg, rf)
@@ -725,6 +921,100 @@ func (rf *Raft) sendApplyMsg(start int, end int) {
 	}
 	// update LastApplied after we apply to state machine
 	rf.LastApplied = end
+}
+
+func (rf *Raft) followerAppendLogEntry(reqAppend *AppendEntriesArgs, rspAppend *AppendEntriesReply) {
+	// refer to https://stackoverflow.com/questions/16248241/concatenate-two-slices-in-go
+	rf.Log = append(rf.Log[:rf.getLogEntryIndexFromGlobalIndex(reqAppend.PrevLogIndex)+1], reqAppend.Entries...)
+	lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+	if reqAppend.LeaderCommit > rf.CommitIndex {
+		oldCommitIndex := rf.CommitIndex
+		rf.CommitIndex = min(reqAppend.LeaderCommit, lastLogEntryIndex)
+		rf.sendApplyMsg(rf.getLogEntryIndexFromGlobalIndex(oldCommitIndex+1), rf.getLogEntryIndexFromGlobalIndex(rf.CommitIndex))
+	}
+	rspAppend.NextIndex = lastLogEntryIndex + 1
+	rspAppend.Success = true
+	// save to persist when follower successfully append new Entry from leader
+	rf.persist()
+}
+
+func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppend *AppendEntriesReply, lastAppendEntryReq *AppendEntriesArgs) {
+	// per Fig2 rule when receiving higher term
+	if reqAppend.Term > rf.CurrentTerm {
+		rf.updateTerm(reqAppend.Term)
+		rf.VotedFor = INITIAL_VOTED_FOR
+	}
+	// DPrintf("[followerHandler][%v]: %+v, %+v\n", reqAppend, rf)
+	// what if leaderId != rf.VotedFor, but term the same , should reject and check it ?
+	if reqAppend.Term >= rf.CurrentTerm && reqAppend.LeadId == rf.VotedFor {
+		if lastAppendEntryReq != nil && lastAppendEntryReq.TimeStamp >= reqAppend.TimeStamp {
+			DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, *lastAppendEntryReq)
+			rspAppend.IsValid = false
+			rf.AppendEntriesReplyChan <- rspAppend
+			// do I need to reset election timer here? but since it is older request, I think we should not reset it
+			// timer = time.After(getRandElectionTimeoutMiliSecond())
+			return
+		}
+		lastAppendEntryReq = reqAppend
+		// seperate to below cases:
+		// 1) if reqAppend.PrevLogIndex == rf.SnapshotLastIndex, it should
+		//    have same term, if not panic, otherwise append entry and
+		//    return success
+		// 2) else if lastLogEntryIndex == rf.SnapshotLastIndex, this would mean
+		//    we don't have any thing in log, can't compare further, reply leader
+		//    nextIndex = snapshotLastIndex + 1, and next time leader would give
+		//    "reqAppend.PrevLogIndex == rf.SnapshotLastIndex" which would fall
+		//    in case(1)
+		// 3) else if localPrevLogIndex within rf.Log range and term are the
+		//    same, return success
+		// 4) for the rest of case, first get the min(localPrevLogIndex, localLastIndex)
+		//    then do the search for conflict term
+		// [Note] : here local means the index for rf.Log, global means
+		//          the index among all the raft instance
+		localAppendEntryPrevLogIndex := rf.getLogEntryIndexFromGlobalIndex(reqAppend.PrevLogIndex)
+		lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+		localLastLogEntryIndex := rf.getLogEntryIndexFromGlobalIndex(lastLogEntryIndex)
+
+		if reqAppend.PrevLogIndex == rf.SnapshotLastIndex {
+			panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(1) yet rf:%+v\n",
+				rf.me, rf))
+			// case(1)
+			if rf.SnapshotLastTerm != reqAppend.PrevLogTerm {
+				panic(fmt.Sprintf("[%v][followerHandler] snapshot (index:%v, term:%v) term != reqAppend.PrevLogTerm:%v, rf:%+v\n",
+					rf.me, rf.SnapshotLastIndex, rf.SnapshotLastTerm, reqAppend.PrevLogTerm, rf))
+			}
+			rf.followerAppendLogEntry(reqAppend, rspAppend)
+		} else if lastLogEntryIndex == rf.SnapshotLastIndex {
+			panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(2) yet rf:%+v\n",
+				rf.me, rf))
+			// case(2)
+			rspAppend.NextIndex = rf.SnapshotLastIndex + 1
+		} else if localAppendEntryPrevLogIndex >= 0 && localAppendEntryPrevLogIndex < len(rf.Log) && rf.Log[localAppendEntryPrevLogIndex].Term == reqAppend.PrevLogTerm {
+			// case(3)
+			rf.followerAppendLogEntry(reqAppend, rspAppend)
+		} else {
+			// case(4)
+			localCheckIndex := min(localAppendEntryPrevLogIndex, localLastLogEntryIndex)
+			if localCheckIndex < 0 || localCheckIndex >= len(rf.Log) {
+				panic(fmt.Sprintf("[%v][followerHandler] localCheckIndex:%v is out of bound, len(rf.Log):%v, rf:%+v\n",
+					rf.me, localCheckIndex, len(rf.Log), rf))
+			}
+			// if we have conflict term, search for first index that has leader prevLogTerm
+			// this rule is per https://pdos.csail.mit.edu/6.824/notes/l-raft2.txt
+			if reqAppend.PrevLogTerm != rf.Log[localCheckIndex].Term {
+				rspAppend.ConflictTerm = rf.Log[localCheckIndex].Term
+				// try to find first index of conflict term
+				rspAppend.ConflictTermFirstIndex = rf.binarySearchForTerm(rf.Log, 0, localCheckIndex, rspAppend.ConflictTerm, true)
+				if rspAppend.ConflictTermFirstIndex == -1 {
+					panic(fmt.Sprintf("[%v][followerHandler] can't find conflict term:%v in its log(%v,%v) in rf:%+v", rf.me, rspAppend.ConflictTerm, 0, localCheckIndex, rf))
+				}
+			}
+			rspAppend.NextIndex = localCheckIndex + 1 + rf.SnapshotLastIndex + 1
+		}
+	}
+	rspAppend.Term = rf.CurrentTerm
+	rspAppend.VotedFor = rf.VotedFor
+	rf.AppendEntriesReplyChan <- rspAppend
 }
 
 func followerHandler(rf *Raft) {
@@ -782,61 +1072,7 @@ func followerHandler(rf *Raft) {
 				ConflictTerm:           -1,
 				ConflictTermFirstIndex: -1,
 			}
-			// per Fig2 rule when receiving higher term
-			if reqAppend.Term > rf.CurrentTerm {
-				rf.updateTerm(reqAppend.Term)
-				rf.VotedFor = INITIAL_VOTED_FOR
-			}
-			// DPrintf("[followerHandler][%v]: %+v, %+v\n", reqAppend, rf)
-			// what if leaderId != rf.VotedFor, but term the same , should reject and check it ?
-			if reqAppend.Term >= rf.CurrentTerm && reqAppend.LeadId == rf.VotedFor {
-				if lastAppendEntryReq != nil && lastAppendEntryReq.TimeStamp >= reqAppend.TimeStamp {
-					DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, *lastAppendEntryReq)
-					rspAppend.IsValid = false
-					rf.AppendEntriesReplyChan <- &rspAppend
-					// do I need to reset election timer here? but since it is older request, I think we should not reset it
-					// timer = time.After(getRandElectionTimeoutMiliSecond())
-					continue
-				}
-				lastAppendEntryReq = reqAppend
-				if reqAppend.PrevLogIndex < len(rf.Log) && rf.Log[reqAppend.PrevLogIndex].Term == reqAppend.PrevLogTerm {
-					// refer to https://stackoverflow.com/questions/16248241/concatenate-two-slices-in-go
-					rf.Log = append(rf.Log[:reqAppend.PrevLogIndex+1], reqAppend.Entries...)
-					if reqAppend.LeaderCommit > rf.CommitIndex {
-						oldCommitIndex := rf.CommitIndex
-						// rf.CommitIndex = int(math.Min(float64(reqAppend.LeaderCommit), float64(len(rf.Log)-1)))
-						rf.CommitIndex = min(reqAppend.LeaderCommit, len(rf.Log)-1)
-						rf.sendApplyMsg(oldCommitIndex+1, rf.CommitIndex)
-					}
-					rspAppend.NextIndex = len(rf.Log)
-					rspAppend.Success = true
-					// save to persist when follower successfully append new Entry from leader
-					rf.persist()
-				} else {
-					// nextIdx := int(math.Min(float64(reqAppend.PrevLogIndex), float64(len(rf.Log))))
-					nextIdx := min(reqAppend.PrevLogIndex+1, len(rf.Log))
-					// since log idx 0 is already done, just need to try up to 2
-					// for ; nextIdx > 1; nextIdx-- {
-					// 	if rf.Log[nextIdx-1].Term == reqAppend.PrevLogTerm {
-					// 		break
-					// 	}
-					// }
-					// if we have conflict term, search for first index that has leader prevLogTerm
-					// this rule is per https://pdos.csail.mit.edu/6.824/notes/l-raft2.txt
-					if rf.Log[nextIdx-1].Term != reqAppend.PrevLogTerm {
-						rspAppend.ConflictTerm = rf.Log[nextIdx-1].Term
-						// try to find first index of conflict term
-						rspAppend.ConflictTermFirstIndex = rf.binarySearchForTerm(rf.Log, 0, nextIdx-1, rspAppend.ConflictTerm, true)
-						if rspAppend.ConflictTermFirstIndex == -1 {
-							panic(fmt.Sprintf("[%v][followerHandler] can't find conflict term:%v in its log in (%v, %v)", rf.me, rspAppend.ConflictTerm, 0, nextIdx-1))
-						}
-					}
-					rspAppend.NextIndex = nextIdx
-				}
-			}
-			rspAppend.Term = rf.CurrentTerm
-			rspAppend.VotedFor = rf.VotedFor
-			rf.AppendEntriesReplyChan <- &rspAppend
+			rf.followerAppendEntryHandler(reqAppend, &rspAppend, lastAppendEntryReq)
 			// if ack an Append RPC, reset timer
 			if rspAppend.Success || rf.VotedFor == reqAppend.LeadId {
 				// return
@@ -882,7 +1118,7 @@ func candidateHandler(rf *Raft) {
 	// 		voteReplyChan <- &reply
 	// 	}
 	// }
-
+	lastLogEntryIndex, lastLogEntryTerm := rf.getLastLogEntryInfo()
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -890,8 +1126,8 @@ func candidateHandler(rf *Raft) {
 		argvs := RequestVoteArgs{
 			Term:         rf.CurrentTerm,
 			CandidateId:  rf.me,
-			LastLogIndex: len(rf.Log) - 1,
-			LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+			LastLogIndex: lastLogEntryIndex,
+			LastLogTerm:  lastLogEntryTerm,
 		}
 		// go sendVoteTask(rf.CurrentTerm, rf.me, i, voteReplyChan, &argvs)
 		workerReq := RequestVoteWorkerReq{
@@ -983,37 +1219,57 @@ func (rf *Raft) redirectAppendHelper(reqVote *AppendEntriesArgs) {
 
 // helper to prepare appendEntries and send out reqeust ,
 // this API should only be called in raft instance thread
-func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *AppendEntriesReply) {
-	if rf.NextIndex[destServer]-1 < 0 || rf.NextIndex[destServer]-1 >= len(rf.Log) {
-		panic(fmt.Sprintf("[%v][appendEntriesHelper] (rf.NextIndex[%v]-1):%v is out of bound, rf:%+v", rf.me, destServer, rf.NextIndex[destServer]-1, rf))
-	}
-	argvs := AppendEntriesArgs{
-		Term:         rf.CurrentTerm,
-		LeadId:       rf.me,
-		PrevLogIndex: rf.NextIndex[destServer] - 1,
-		PrevLogTerm:  rf.Log[rf.NextIndex[destServer]-1].Term,
-		LeaderCommit: rf.CommitIndex,
-		TimeStamp:    time.Now().UnixNano(),
-	}
-	tmpLog := rf.Log[rf.NextIndex[destServer]:len(rf.Log)]
+func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *AppendEntriesReply, installSnapReplyChan chan *InstallSnapshotReply) {
 	// don't need to send the appendEntry if the interval from last sent smaller than heartbeat interval
 	if time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
 		return
 	}
-	argvs.Entries = make([]LogEntry, len(tmpLog))
-	copy(argvs.Entries, tmpLog)
-	// reply := AppendEntriesReply{}
-	// go func() {
-	// 	if rf.sendAppendEntries(destServer, &argvs, &reply) {
-	// 		if reply.IsValid {
-	// 			appendReplyChan <- &reply
-	// 		}
-	// 	}
-	// }()
-	workerReq := AppendEntriesWorkerReq{
-		args:      &argvs,
-		replyChan: appendReplyChan,
+	prevLogIndex, prevLogTerm := rf.getLogEntryInfo(rf.NextIndex[destServer] - 1)
+	var workerReq interface{}
+
+	// startIndexForNextLogEntries < 0 would mean current log doesn't have the entry,
+	// we need to install snapshot
+	if prevLogIndex < 0 {
+		// go with install snapshot
+		// panic(fmt.Sprintf("[%v][appendEntriesHelper] prevLogIndex:%v, should not go into install snapshot yet, destServer:%v, rf:%+v",
+		// 	rf.me, prevLogIndex, destServer, rf))
+
+		argvs := InstallSnapshotArgs{
+			Term:              rf.CurrentTerm,
+			LeadId:            rf.me,
+			LastIncludedIndex: rf.SnapshotLastIndex,
+			LastIncludedTerm:  rf.SnapshotLastTerm,
+			Data:              rf.persister.ReadSnapshot(),
+			TimeStamp:         time.Now().UnixNano(),
+		}
+		workerReq = InstallSnapshotWorkerReq{
+			args:      &argvs,
+			replyChan: installSnapReplyChan,
+		}
+		rf.NextIndex[destServer] = rf.SnapshotLastIndex + 1
+		rf.MatchIndex[destServer] = rf.SnapshotLastIndex
+	} else {
+		// if startIndexForNextLogEntries-1 < 0 || startIndexForNextLogEntries-1 >= len(rf.Log) {
+		// 	panic(fmt.Sprintf("[%v][appendEntriesHelper] (startIndexForNextLogEntries-1):%v is out of bound, destServer:%v, rf:%+v",
+		// 		rf.me, startIndexForNextLogEntries-1, destServer, rf))
+		// }
+		argvs := AppendEntriesArgs{
+			Term:         rf.CurrentTerm,
+			LeadId:       rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: rf.CommitIndex,
+			TimeStamp:    time.Now().UnixNano(),
+		}
+		tmpLog := rf.Log[rf.getLogEntryIndexFromGlobalIndex(rf.NextIndex[destServer]):len(rf.Log)]
+		argvs.Entries = make([]LogEntry, len(tmpLog))
+		copy(argvs.Entries, tmpLog)
+		workerReq = AppendEntriesWorkerReq{
+			args:      &argvs,
+			replyChan: appendReplyChan,
+		}
 	}
+
 	go rf.startRaftOneTimeWorkerThread(destServer, workerReq, rf.CurrentTerm, rf.CurrentRaftState)
 	rf.LastAppendEntrySentTime[destServer] = time.Now()
 }
@@ -1025,7 +1281,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		panic(fmt.Sprintf("unexpected raft state for updateLeaderCommitIndex: %v", rf.CurrentRaftState))
 	}
 	oldCommitIndex := rf.CommitIndex
-	for i := rf.CommitIndex + 1; i < len(rf.Log); i++ {
+	for i := rf.getLogEntryIndexFromGlobalIndex(rf.CommitIndex + 1); i < len(rf.Log); i++ {
 		if rf.Log[i].Term != rf.CurrentTerm {
 			// DPrintf("[%v][updateLeaderCommitIndex] rf.Log[%v].Term:%v != rf.CurrentTerm:%v\n", rf.me, i, rf.Log[i].Term, rf.CurrentTerm)
 			// there is a bug here I dig a while to figure out:
@@ -1037,32 +1293,19 @@ func (rf *Raft) updateLeaderCommitIndex() {
 		}
 		cnt := 0
 		for peerIdx := range rf.peers {
-			if rf.MatchIndex[peerIdx] >= i {
+			if rf.MatchIndex[peerIdx] >= rf.Log[i].Index {
 				cnt++
 			}
 		}
-		DPrintf("[%v][updateLeaderCommitIndex] cnt:%v, i:%v\n", rf.me, cnt, i)
+		DPrintf("[%v][updateLeaderCommitIndex] cnt:%v, rf.Log[%v].Index:%v\n", rf.me, cnt, i, rf.Log[i].Index)
 		if cnt > len(rf.peers)/2 {
-			rf.CommitIndex = i
+			rf.CommitIndex = rf.Log[i].Index
 		} else {
 			break
 		}
 	}
 	// DPrintf("[%v][updateLeaderCommitIndex] start:%v, end:%v, rf:%+v\n", rf.me, oldCommitIndex+1, rf.CommitIndex, rf)
-	rf.sendApplyMsg(oldCommitIndex+1, rf.CommitIndex)
-}
-
-// helper API to add NoOp entry as initial step for leader
-func (rf *Raft) AppendNoOpEntry() {
-	if rf.CurrentRaftState != leader {
-		panic(fmt.Sprintf("[rf:%v]AppendNoOpEntry: not a leader, current is %+v!n", rf.me, rf.CurrentRaftState))
-	}
-
-	rf.Log = append(rf.Log, LogEntry{
-		Term: rf.CurrentTerm,
-	})
-	rf.MatchIndex[rf.me] = len(rf.Log) - 1
-	rf.NextIndex[rf.me] = len(rf.Log)
+	rf.sendApplyMsg(rf.getLogEntryIndexFromGlobalIndex(oldCommitIndex+1), rf.getLogEntryIndexFromGlobalIndex(rf.CommitIndex))
 }
 
 func leaderHandler(rf *Raft) {
@@ -1071,11 +1314,12 @@ func leaderHandler(rf *Raft) {
 	// - handle AppendEntries,
 	// - handle RequestVote
 	rf.initIndex()
-	// rf.AppendNoOpEntry()
 	rf.printInfo()
 	timer := time.After(0)
 	appendReplyChan := make(chan *AppendEntriesReply, 8192)
+	installSnapshotReplyChan := make(chan *InstallSnapshotReply, 8192)
 	lastAppendReqly := make([]*AppendEntriesReply, len(rf.peers))
+	lastInstallshotReqly := make([]*InstallSnapshotReply, len(rf.peers))
 
 	for {
 		DPrintf("[%v][leaderHandler] start of for loop: rf:%+v", rf.me, rf)
@@ -1084,11 +1328,12 @@ func leaderHandler(rf *Raft) {
 			DPrintf("[%v][leaderHandler] timer is up", rf.me)
 			for i := range rf.peers {
 				if i == rf.me {
-					rf.NextIndex[rf.me] = len(rf.Log)
-					rf.MatchIndex[rf.me] = len(rf.Log) - 1
+					lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+					rf.NextIndex[rf.me] = lastLogEntryIndex + 1
+					rf.MatchIndex[rf.me] = lastLogEntryIndex
 					continue
 				}
-				rf.appendEntriesHelper(i, appendReplyChan)
+				rf.appendEntriesHelper(i, appendReplyChan, installSnapshotReplyChan)
 			}
 			timer = time.After(LEADER_PEER_TICK_MILISECONDS * time.Millisecond)
 		case reqVote := <-rf.RequestVoteArgsChan:
@@ -1165,8 +1410,23 @@ func leaderHandler(rf *Raft) {
 							rf.me, rf.MatchIndex[appendReply.FromId], rf.NextIndex[appendReply.FromId]))
 					}
 					rf.NextIndex[appendReply.FromId] = max(rf.NextIndex[appendReply.FromId], rf.MatchIndex[appendReply.FromId])
-					rf.appendEntriesHelper(appendReply.FromId, appendReplyChan)
+					rf.appendEntriesHelper(appendReply.FromId, appendReplyChan, installSnapshotReplyChan)
 				}
+			}
+		case installSnapshotReply := <-installSnapshotReplyChan:
+			DPrintf("[%v][leaderHandler] received installSnapshotReply:%+v, lastInstallshotReqly[%v]:%+v",
+				rf.me, installSnapshotReply, installSnapshotReply.FromId, lastInstallshotReqly[installSnapshotReply.FromId])
+			if lastInstallshotReqly[installSnapshotReply.FromId] != nil && lastInstallshotReqly[installSnapshotReply.FromId].TimeStamp >= installSnapshotReply.TimeStamp {
+				DPrintf("[%v][leaderHandler] received older installSnapshotReply:%+v, lastInstallshotReqly:%+v",
+					rf.me, installSnapshotReply, *lastInstallshotReqly[installSnapshotReply.FromId])
+				continue
+			}
+			lastInstallshotReqly[installSnapshotReply.FromId] = installSnapshotReply
+			if installSnapshotReply.Term > rf.CurrentTerm {
+				rf.updateTerm(installSnapshotReply.Term)
+				rf.updateState(follower)
+				rf.VotedFor = INITIAL_VOTED_FOR
+				return
 			}
 		case <-rf.ToStopChan:
 			DPrintf("[%v][leaderHandler] received ToStopChan", rf.me)
@@ -1175,6 +1435,9 @@ func leaderHandler(rf *Raft) {
 		case <-rf.GetStateReqChan:
 			DPrintf("[%v][leaderHandler] received GetStateReqChan", rf.me)
 			rf.GetStateHelper()
+		case msg := <-rf.MsgChan:
+			DPrintf("[%v][leaderHandler] received msg:%+v", rf.me, msg)
+			rf.MsgHandler(msg)
 		case StartReq := <-rf.StartReqChan:
 			DPrintf("[%v][leaderHandler] received StartReq:%+v", rf.me, StartReq)
 			rf.StartHelper(StartReq)
