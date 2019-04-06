@@ -53,7 +53,7 @@ type ApplyMsg struct {
 const ELECTION_TIMEOUT_MILISECONDS = 500
 const ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS = 500
 const HEARTBEAT_TIMEOUT_MILISECONDS = 200
-const LEADER_PEER_TICK_MILISECONDS = 10
+const LEADER_PEER_TICK_MILISECONDS = 200
 const INITIAL_VOTED_FOR = -1
 
 type Raft struct {
@@ -66,34 +66,36 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	CurrentTerm             int                      // current term of raft instance
-	VotedFor                int                      // previous vote for who, initial to -1
-	CurrentRaftState        RaftState                // current raft state
-	RequestVoteArgsChan     chan *RequestVoteArgs    // channel for receiving Request Vote
-	RequestVoteReplyChan    chan *RequestVoteReply   // channel for response Request Vote
-	AppendEntriesArgsChan   chan *AppendEntriesArgs  // channel for receiving Append Entry
-	AppendEntriesReplyChan  chan *AppendEntriesReply // channel for response Append Entry
-	Log                     []LogEntry               // log entries
-	CommitIndex             int                      // indx of highest log entry known to be committed
-	LastApplied             int                      // index of highest log entry applied to state machine
-	NextIndex               []int                    // index of the next log entry to send to the server
-	MatchIndex              []int                    // index of highest log entry known to be replicated on server
-	ApplyChChan             chan *ApplychArgs        // channel for receiving ApplyCh from client
-	ApplyMsgChan            chan ApplyMsg            // channel for updating to tester
-	ToStopChan              chan bool                // channel for stopping the raft instance thread
-	ToStop                  bool                     // indicator for stopping raft instance
-	GetStateReqChan         chan *GetStateReq        // channel for GetState API input
-	GetStateReplyChan       chan *GetStateReply      // channel for GetState API output
-	StartReqChan            chan *StartReq           // channel for Start API input
-	StartReplyChan          chan *StartReply         // channel for Start API output
-	PrevApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
-	NextApplyMsgToken       chan int64               // channel for scheduling go routine to sendMsg to tester
-	LastAppendEntrySentTime []time.Time              // last time stamp sent appendEntry
-	SelfWorkerCloseChan     chan bool                // chan for closing self worker ( which is to handle applych)
-	SelfWorkerChan          chan interface{}         // channel to worker for sending ApplyMsg back to tester
-	SnapshotLastIndex       int                      // index of last log entry for the snapshot, init to -1
-	SnapshotLastTerm        int                      // term of last log entry for the snapshot
-	MsgChan                 chan interface{}         // channel for raft main thread to handle incoming request/msg
+	CurrentTerm              int                        // current term of raft instance
+	VotedFor                 int                        // previous vote for who, initial to -1
+	CurrentRaftState         RaftState                  // current raft state
+	RequestVoteArgsChan      chan *RequestVoteArgs      // channel for receiving Request Vote
+	RequestVoteReplyChan     chan *RequestVoteReply     // channel for response Request Vote
+	AppendEntriesArgsChan    chan *AppendEntriesArgs    // channel for receiving Append Entry
+	AppendEntriesReplyChan   chan *AppendEntriesReply   // channel for response Append Entry
+	Log                      []LogEntry                 // log entries
+	CommitIndex              int                        // indx of highest log entry known to be committed
+	LastApplied              int                        // index of highest log entry applied to state machine
+	NextIndex                []int                      // index of the next log entry to send to the server
+	MatchIndex               []int                      // index of highest log entry known to be replicated on server
+	ApplyChChan              chan *ApplychArgs          // channel for receiving ApplyCh from client
+	ApplyMsgChan             chan ApplyMsg              // channel for updating to tester
+	ToStopChan               chan bool                  // channel for stopping the raft instance thread
+	ToStop                   bool                       // indicator for stopping raft instance
+	GetStateReqChan          chan *GetStateReq          // channel for GetState API input
+	GetStateReplyChan        chan *GetStateReply        // channel for GetState API output
+	StartReqChan             chan *StartReq             // channel for Start API input
+	StartReplyChan           chan *StartReply           // channel for Start API output
+	PrevApplyMsgToken        chan int64                 // channel for scheduling go routine to sendMsg to tester
+	NextApplyMsgToken        chan int64                 // channel for scheduling go routine to sendMsg to tester
+	LastAppendEntrySentTime  []time.Time                // last time stamp sent appendEntry
+	SelfWorkerCloseChan      chan bool                  // chan for closing self worker ( which is to handle applych)
+	SelfWorkerChan           chan interface{}           // channel to worker for sending ApplyMsg back to tester
+	SnapshotLastIndex        int                        // index of last log entry for the snapshot, init to -1
+	SnapshotLastTerm         int                        // term of last log entry for the snapshot
+	MsgChan                  chan interface{}           // channel for raft main thread to handle incoming request/msg
+	appendReplyChan          chan *AppendEntriesReply   // channel for append reply when it is leader
+	installSnapshotReplyChan chan *InstallSnapshotReply // channel for install snapshot reply when it is leader
 }
 
 type GetStateReq struct {
@@ -124,6 +126,16 @@ type InstallSnapshotReq struct {
 	replyChan chan *InstallSnapshotReply
 }
 
+type StartReuqest struct {
+	args      *StartReq
+	replyChan chan *StartReply
+}
+
+type GetStateReuqest struct {
+	args      *GetStateReq
+	replyChan chan *GetStateReply
+}
+
 // serverState indicating current raft instance state
 type RaftState string
 
@@ -151,10 +163,13 @@ const (
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	req := &GetStateReq{}
-	DPrintf("[rf:%v]start GetState: req: %+v\n", rf.me, req)
-	rf.GetStateReqChan <- req
-	reply := <-rf.GetStateReplyChan
+	req := &GetStateReuqest{
+		args:      &GetStateReq{},
+		replyChan: make(chan *GetStateReply),
+	}
+	DPrintf("[rf:%v]start GetState: args: %+v\n", rf.me, req.args)
+	rf.MsgChan <- req
+	reply := <-req.replyChan
 	DPrintf("[rf:%v]done GetState: reply: %+v\n", rf.me, reply)
 	return reply.term, reply.isLeader
 }
@@ -400,12 +415,15 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	req := &StartReq{
-		command: command,
+	req := &StartReuqest{
+		args: &StartReq{
+			command: command,
+		},
+		replyChan: make(chan *StartReply),
 	}
-	DPrintf("[rf:%v]start Start: req: %+v\n", rf.me, req)
-	rf.StartReqChan <- req
-	reply := <-rf.StartReplyChan
+	DPrintf("[rf:%v]start Start: args: %+v\n", rf.me, req.args)
+	rf.MsgChan <- req
+	reply := <-req.replyChan
 	DPrintf("[rf:%v]done Start: req: %+v, reply: %+v\n", rf.me, req, reply)
 	return reply.index, reply.term, reply.isLeader
 }
@@ -454,24 +472,25 @@ func (rf *Raft) initIndex() {
 
 }
 
-func (rf *Raft) GetStateHelper() {
-	rf.GetStateReplyChan <- &GetStateReply{
+func (rf *Raft) GetStateHelper(req *GetStateReuqest) {
+	req.replyChan <- &GetStateReply{
 		term:     rf.CurrentTerm,
 		isLeader: rf.CurrentRaftState == leader,
 	}
 }
 
-func (rf *Raft) StartHelper(req *StartReq) {
+func (rf *Raft) StartHelper(req *StartReuqest) {
 	if rf.CurrentRaftState == leader {
 		rf.Log = append(rf.Log, LogEntry{
 			Term:    rf.CurrentTerm,
-			Command: req.command,
+			Command: req.args.command,
 			Index:   rf.NextIndex[rf.me],
 		})
 		rf.MatchIndex[rf.me] = rf.NextIndex[rf.me]
 		rf.NextIndex[rf.me]++
+		rf.leaderBroadcast(rf.appendReplyChan, rf.installSnapshotReplyChan)
 	}
-	rf.StartReplyChan <- &StartReply{
+	req.replyChan <- &StartReply{
 		index:    rf.MatchIndex[rf.me],
 		term:     rf.CurrentTerm,
 		isLeader: rf.CurrentRaftState == leader,
@@ -532,14 +551,28 @@ func (rf *Raft) EncodeState() (state []byte) {
 
 func (rf *Raft) createSnapshotHelper(req *CreateSnapshotReq) {
 	// prepare the data to store
+	if req.lastApplyMsg == nil {
+		panic(fmt.Sprintf("[rf:%v][createSnapshotHelper] req.lastApplyMsg is nil! req:%+v, rf:%+v\n",
+			rf.me, req, rf))
+	}
+	DPrintf("[rf:%v] createSnapshotHelper: to handle CreateSnapshotReq:%+v, lastApplyMsg:%+v\n",
+		rf.me, req, req.lastApplyMsg)
+	localCutOffIndex := rf.getLogEntryIndexFromGlobalIndex(req.lastApplyMsg.CommandIndex)
+	if localCutOffIndex < 0 || localCutOffIndex >= len(rf.Log) {
+		panic(fmt.Sprintf("[rf:%v][createSnapshotHelper] invalid index for log:%v, rf:%+v\n",
+			rf.me, localCutOffIndex, rf))
+	}
+	rf.SnapshotLastTerm = rf.Log[localCutOffIndex].Term
 	rf.SnapshotLastIndex = req.lastApplyMsg.CommandIndex
-	rf.SnapshotLastTerm = rf.Log[rf.SnapshotLastIndex].Term
+	// cut off older log which is included in snapshot
+	rf.Log = rf.Log[localCutOffIndex+1:]
+
 	state := rf.EncodeState()
 	// save both rf state and kv state into persist snapshot
 	rf.persister.SaveStateAndSnapshot(state, req.kvState)
 
-	// cut off older log which is included in snapshot
-	rf.Log = rf.Log[rf.SnapshotLastIndex+1:]
+	DPrintf("[rf:%v] createSnapshotHelper: done handle CreateSnapshotReq: rf%+v\n",
+		rf.me, rf)
 }
 
 func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
@@ -556,10 +589,17 @@ func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
 			panic(fmt.Sprintf("[%v][InstallSnapshotHelper] not expect go to this point under state:%v, rf:%+v",
 				rf.me, rf.CurrentRaftState, rf))
 		}
+		// localCutOffIndex >= len(rf.Log) would be the case where follower is lagging behind
+		localCutOffIndex := min(rf.getLogEntryIndexFromGlobalIndex(req.args.LastIncludedIndex), len(rf.Log)-1)
 		rf.SnapshotLastIndex = req.args.LastIncludedIndex
 		rf.SnapshotLastTerm = req.args.LastIncludedTerm
 		// cut off older log which is included in snapshot
-		rf.Log = rf.Log[rf.SnapshotLastIndex+1:]
+		if localCutOffIndex < -1 || localCutOffIndex >= len(rf.Log) {
+			panic(fmt.Sprintf("[rf:%v][InstallSnapshotHelper] invalid index for log:%v, rf:%+v\n",
+				rf.me, localCutOffIndex, rf))
+		}
+		rf.Log = rf.Log[localCutOffIndex+1:]
+		rf.CommitIndex = rf.SnapshotLastIndex
 		state := rf.EncodeState()
 		rf.persister.SaveStateAndSnapshot(state, req.args.Data)
 		// ask self worker to send applymsg with update data from snapshot to KV peer
@@ -569,30 +609,99 @@ func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
 	}
 }
 
+func (rf *Raft) MsgFlusher() {
+	startAt := time.Now()
+loop:
+	for {
+		select {
+		case msg := <-rf.MsgChan:
+			switch msgType := msg.(type) {
+			case *StartReuqest:
+				if req, ok := msg.(*StartReuqest); ok {
+					DPrintf("[%v] MsgFlusher: to handle StartReuqest: args:%+v, startAt:%+v\n",
+						rf.me, req.args, startAt)
+					req.replyChan <- &StartReply{
+						isLeader: false,
+					}
+					DPrintf("[%v] MsgFlusher: done handle StartReuqest: startAt:%+v\n",
+						rf.me, startAt)
+				} else {
+					panic(fmt.Sprintf("[%v] MsgFlusher: can't handle msgType:%+v, msg:%+v\n",
+						rf.me, msgType, req))
+				}
+			case *GetStateReuqest:
+				if req, ok := msg.(*GetStateReuqest); ok {
+					DPrintf("[%v] MsgFlusher: to handle GetStateReuqest: args:%+v, startAt:%+v\n",
+						rf.me, req.args, startAt)
+					req.replyChan <- &GetStateReply{
+						isLeader: false,
+					}
+					DPrintf("[%v] MsgFlusher: done handle GetStateReuqest: startAt:%+v\n",
+						rf.me, startAt)
+				} else {
+					panic(fmt.Sprintf("[%v] MsgFlusher: can't handle msgType:%+v, msg:%+v\n",
+						rf.me, msgType, req))
+				}
+			default:
+				DPrintf("[%v] MsgHandler: ignore msgType:%+v, msg:%+v\n",
+					rf.me, msgType, msg)
+			}
+		default:
+			break loop
+		}
+	}
+}
+
 func (rf *Raft) MsgHandler(msg interface{}) {
+	startAt := time.Now()
 	switch msgType := msg.(type) {
 	case *CreateSnapshotReq:
 		if req, ok := msg.(*CreateSnapshotReq); ok {
-			DPrintf("[%v] MsgHandler: to handle CreateSnapshotReq:%+v\n",
-				rf.me, req)
+			DPrintf("[%v] MsgHandler: to handle CreateSnapshotReq: kvState:%+v, lastApplyMsg:%+v, startAt:%+v\n",
+				rf.me, req.kvState, req.lastApplyMsg, startAt)
 			rf.createSnapshotHelper(req)
-			DPrintf("[%v] MsgHandler: done handle CreateSnapshotReq:%+v\n",
-				rf.me, req)
+			DPrintf("[%v] MsgHandler: done handle CreateSnapshotReq: startAt:%+v\n",
+				rf.me, startAt)
 		} else {
 			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
 				rf.me, msgType, req))
 		}
 	case *InstallSnapshotReq:
 		if req, ok := msg.(*InstallSnapshotReq); ok {
-			DPrintf("[%v] MsgHandler: to handle InstallSnapshotReq:%+v\n",
-				rf.me, req)
+			DPrintf("[%v] MsgHandler: to handle InstallSnapshotReq: args:%+v, startAt:%+v\n",
+				rf.me, req.args, startAt)
 			rf.InstallSnapshotHelper(req)
-			DPrintf("[%v] MsgHandler: done handle InstallSnapshotReq:%+v\n",
-				rf.me, req)
+			DPrintf("[%v] MsgHandler: done handle InstallSnapshotReq: startAt:%+v\n",
+				rf.me, startAt)
 		} else {
 			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
 				rf.me, msgType, req))
 		}
+	case *StartReuqest:
+		if req, ok := msg.(*StartReuqest); ok {
+			DPrintf("[%v] MsgHandler: to handle StartReuqest: args:%+v, startAt:%+v\n",
+				rf.me, req.args, startAt)
+			rf.StartHelper(req)
+			DPrintf("[%v] MsgHandler: done handle StartReuqest: startAt:%+v\n",
+				rf.me, startAt)
+		} else {
+			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
+				rf.me, msgType, req))
+		}
+	case *GetStateReuqest:
+		if req, ok := msg.(*GetStateReuqest); ok {
+			DPrintf("[%v] MsgHandler: to handle GetStateReuqest: args:%+v, startAt:%+v\n",
+				rf.me, req.args, startAt)
+			rf.GetStateHelper(req)
+			DPrintf("[%v] MsgHandler: done handle GetStateReuqest: startAt:%+v\n",
+				rf.me, startAt)
+		} else {
+			panic(fmt.Sprintf("[%v] MsgHandler: can't handle msgType:%+v, msg:%+v\n",
+				rf.me, msgType, req))
+		}
+	default:
+		panic(fmt.Sprintf("[%v] MsgHandler: unexpected msgType:%+v, msg:%+v\n",
+			rf.me, msgType, msg))
 	}
 
 }
@@ -862,6 +971,7 @@ func startRaftThread(rf *Raft) {
 		}
 		if rf.ToStop {
 			rf.stopSelfWorker()
+			rf.MsgFlusher()
 			return
 		}
 	}
@@ -936,9 +1046,11 @@ func (rf *Raft) followerAppendLogEntry(reqAppend *AppendEntriesArgs, rspAppend *
 	rspAppend.Success = true
 	// save to persist when follower successfully append new Entry from leader
 	rf.persist()
+	DPrintf("[%v][followerAppendLogEntry] done raftStateSize:%+v, reqAppend:%+v, rspAppend:%+v\n",
+		rf.me, rf.persister.RaftStateSize(), reqAppend, rspAppend)
 }
 
-func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppend *AppendEntriesReply, lastAppendEntryReq *AppendEntriesArgs) {
+func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppend *AppendEntriesReply, lastAppendEntryReq **AppendEntriesArgs) {
 	// per Fig2 rule when receiving higher term
 	if reqAppend.Term > rf.CurrentTerm {
 		rf.updateTerm(reqAppend.Term)
@@ -947,15 +1059,15 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 	// DPrintf("[followerHandler][%v]: %+v, %+v\n", reqAppend, rf)
 	// what if leaderId != rf.VotedFor, but term the same , should reject and check it ?
 	if reqAppend.Term >= rf.CurrentTerm && reqAppend.LeadId == rf.VotedFor {
-		if lastAppendEntryReq != nil && lastAppendEntryReq.TimeStamp >= reqAppend.TimeStamp {
-			DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, *lastAppendEntryReq)
+		if *lastAppendEntryReq != nil && (*lastAppendEntryReq).TimeStamp >= reqAppend.TimeStamp {
+			DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, **lastAppendEntryReq)
 			rspAppend.IsValid = false
 			rf.AppendEntriesReplyChan <- rspAppend
 			// do I need to reset election timer here? but since it is older request, I think we should not reset it
 			// timer = time.After(getRandElectionTimeoutMiliSecond())
 			return
 		}
-		lastAppendEntryReq = reqAppend
+		*lastAppendEntryReq = reqAppend
 		// seperate to below cases:
 		// 1) if reqAppend.PrevLogIndex == rf.SnapshotLastIndex, it should
 		//    have same term, if not panic, otherwise append entry and
@@ -976,8 +1088,8 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 		localLastLogEntryIndex := rf.getLogEntryIndexFromGlobalIndex(lastLogEntryIndex)
 
 		if reqAppend.PrevLogIndex == rf.SnapshotLastIndex {
-			panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(1) yet rf:%+v\n",
-				rf.me, rf))
+			// panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(1) yet rf:%+v\n",
+			// 	rf.me, rf))
 			// case(1)
 			if rf.SnapshotLastTerm != reqAppend.PrevLogTerm {
 				panic(fmt.Sprintf("[%v][followerHandler] snapshot (index:%v, term:%v) term != reqAppend.PrevLogTerm:%v, rf:%+v\n",
@@ -985,8 +1097,8 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 			}
 			rf.followerAppendLogEntry(reqAppend, rspAppend)
 		} else if lastLogEntryIndex == rf.SnapshotLastIndex {
-			panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(2) yet rf:%+v\n",
-				rf.me, rf))
+			// panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(2) yet rf:%+v\n",
+			// 	rf.me, rf))
 			// case(2)
 			rspAppend.NextIndex = rf.SnapshotLastIndex + 1
 		} else if localAppendEntryPrevLogIndex >= 0 && localAppendEntryPrevLogIndex < len(rf.Log) && rf.Log[localAppendEntryPrevLogIndex].Term == reqAppend.PrevLogTerm {
@@ -1072,7 +1184,7 @@ func followerHandler(rf *Raft) {
 				ConflictTerm:           -1,
 				ConflictTermFirstIndex: -1,
 			}
-			rf.followerAppendEntryHandler(reqAppend, &rspAppend, lastAppendEntryReq)
+			rf.followerAppendEntryHandler(reqAppend, &rspAppend, &lastAppendEntryReq)
 			// if ack an Append RPC, reset timer
 			if rspAppend.Success || rf.VotedFor == reqAppend.LeadId {
 				// return
@@ -1082,12 +1194,15 @@ func followerHandler(rf *Raft) {
 			DPrintf("[%v][followerHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 			return
-		case <-rf.GetStateReqChan:
-			DPrintf("[%v][followerHandler] received GetStateReqChan", rf.me)
-			rf.GetStateHelper()
-		case StartReq := <-rf.StartReqChan:
-			DPrintf("[%v][followerHandler] received StartReqChan:%+v", rf.me, StartReq)
-			rf.StartHelper(StartReq)
+		// case <-rf.GetStateReqChan:
+		// 	DPrintf("[%v][followerHandler] received GetStateReqChan", rf.me)
+		// 	rf.GetStateHelper()
+		// case StartReq := <-rf.StartReqChan:
+		// 	DPrintf("[%v][followerHandler] received StartReqChan:%+v", rf.me, StartReq)
+		// 	rf.StartHelper(StartReq)
+		case msg := <-rf.MsgChan:
+			DPrintf("[%v][followerHandler] received msg:%+v", rf.me, msg)
+			rf.MsgHandler(msg)
 		}
 		DPrintf("[%v][followerHandler] end of for loop: rf:%+v", rf.me, rf)
 	}
@@ -1197,12 +1312,15 @@ func candidateHandler(rf *Raft) {
 			DPrintf("[%v][candidateHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 			return
-		case <-rf.GetStateReqChan:
-			DPrintf("[%v][candidateHandler] received GetStateReqChan", rf.me)
-			rf.GetStateHelper()
-		case StartReq := <-rf.StartReqChan:
-			DPrintf("[%v][candidateHandler] received StartReqChan:%+v", rf.me, StartReq)
-			rf.StartHelper(StartReq)
+		// case <-rf.GetStateReqChan:
+		// 	DPrintf("[%v][candidateHandler] received GetStateReqChan", rf.me)
+		// 	rf.GetStateHelper()
+		// case StartReq := <-rf.StartReqChan:
+		// 	DPrintf("[%v][candidateHandler] received StartReqChan:%+v", rf.me, StartReq)
+		// 	rf.StartHelper(StartReq)
+		case msg := <-rf.MsgChan:
+			DPrintf("[%v][candidateHandler] received msg:%+v", rf.me, msg)
+			rf.MsgHandler(msg)
 		}
 		DPrintf("[%v][candidateHandler] start of for loop: rf:%+v", rf.me, rf)
 		rf.persist()
@@ -1220,12 +1338,15 @@ func (rf *Raft) redirectAppendHelper(reqVote *AppendEntriesArgs) {
 // helper to prepare appendEntries and send out reqeust ,
 // this API should only be called in raft instance thread
 func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *AppendEntriesReply, installSnapReplyChan chan *InstallSnapshotReply) {
-	// don't need to send the appendEntry if the interval from last sent smaller than heartbeat interval
-	if time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
-		return
-	}
 	prevLogIndex, prevLogTerm := rf.getLogEntryInfo(rf.NextIndex[destServer] - 1)
+	// lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
 	var workerReq interface{}
+
+	// don't need to send the appendEntry if the interval from last sent smaller than heartbeat interval
+	// if lastLogEntryIndex == rf.NextIndex[destServer]-1 && time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
+	// if time.Now().Sub(rf.LastAppendEntrySentTime[destServer]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
+	// 	return
+	// }
 
 	// startIndexForNextLogEntries < 0 would mean current log doesn't have the entry,
 	// we need to install snapshot
@@ -1308,6 +1429,18 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	rf.sendApplyMsg(rf.getLogEntryIndexFromGlobalIndex(oldCommitIndex+1), rf.getLogEntryIndexFromGlobalIndex(rf.CommitIndex))
 }
 
+func (rf *Raft) leaderBroadcast(appendReplyChan chan *AppendEntriesReply, installSnapReplyChan chan *InstallSnapshotReply) {
+	for i := range rf.peers {
+		if i == rf.me {
+			lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+			rf.NextIndex[rf.me] = lastLogEntryIndex + 1
+			rf.MatchIndex[rf.me] = lastLogEntryIndex
+			continue
+		}
+		rf.appendEntriesHelper(i, appendReplyChan, installSnapReplyChan)
+	}
+}
+
 func leaderHandler(rf *Raft) {
 	// - send out heatbeat immediately as initial step then send out periodcally
 	// - handle heartbeat timeout, then send it out peridically
@@ -1316,8 +1449,8 @@ func leaderHandler(rf *Raft) {
 	rf.initIndex()
 	rf.printInfo()
 	timer := time.After(0)
-	appendReplyChan := make(chan *AppendEntriesReply, 8192)
-	installSnapshotReplyChan := make(chan *InstallSnapshotReply, 8192)
+	rf.appendReplyChan = make(chan *AppendEntriesReply, 8192)
+	rf.installSnapshotReplyChan = make(chan *InstallSnapshotReply, 8192)
 	lastAppendReqly := make([]*AppendEntriesReply, len(rf.peers))
 	lastInstallshotReqly := make([]*InstallSnapshotReply, len(rf.peers))
 
@@ -1326,15 +1459,19 @@ func leaderHandler(rf *Raft) {
 		select {
 		case <-timer:
 			DPrintf("[%v][leaderHandler] timer is up", rf.me)
-			for i := range rf.peers {
-				if i == rf.me {
-					lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
-					rf.NextIndex[rf.me] = lastLogEntryIndex + 1
-					rf.MatchIndex[rf.me] = lastLogEntryIndex
-					continue
-				}
-				rf.appendEntriesHelper(i, appendReplyChan, installSnapshotReplyChan)
-			}
+			// for i := range rf.peers {
+			// 	if i == rf.me {
+			// 		lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+			// 		rf.NextIndex[rf.me] = lastLogEntryIndex + 1
+			// 		rf.MatchIndex[rf.me] = lastLogEntryIndex
+			// 		continue
+			// 	}
+			// 	// if time.Now().Sub(rf.LastAppendEntrySentTime[i]) < HEARTBEAT_TIMEOUT_MILISECONDS*time.Millisecond {
+			// 	// 	continue
+			// 	// }
+			// 	rf.appendEntriesHelper(i, appendReplyChan, installSnapshotReplyChan)
+			// }
+			rf.leaderBroadcast(rf.appendReplyChan, rf.installSnapshotReplyChan)
 			timer = time.After(LEADER_PEER_TICK_MILISECONDS * time.Millisecond)
 		case reqVote := <-rf.RequestVoteArgsChan:
 			DPrintf("[%v][leaderHandler] received reqVote:%+v", rf.me, reqVote)
@@ -1367,7 +1504,7 @@ func leaderHandler(rf *Raft) {
 				return
 			}
 			rf.AppendEntriesReplyChan <- &rspAppend
-		case appendReply := <-appendReplyChan:
+		case appendReply := <-rf.appendReplyChan:
 			DPrintf("[%v][leaderHandler] received appendReply:%+v, lastAppendReqly[%v]:%+v", rf.me, appendReply, appendReply.FromId, lastAppendReqly[appendReply.FromId])
 			if lastAppendReqly[appendReply.FromId] != nil && lastAppendReqly[appendReply.FromId].TimeStamp >= appendReply.TimeStamp {
 				DPrintf("[%v][leaderHandler] received older appendReply:%+v, lastAppendReqly:%+v", rf.me, appendReply, *lastAppendReqly[appendReply.FromId])
@@ -1386,6 +1523,12 @@ func leaderHandler(rf *Raft) {
 				rf.MatchIndex[appendReply.FromId] = appendReply.NextIndex - 1
 				rf.updateLeaderCommitIndex()
 				rf.persist()
+				// even we receive success, if we have more item for the follower
+				// need to send to them
+				// lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+				// if rf.NextIndex[appendReply.FromId] <= lastLogEntryIndex {
+				// 	rf.appendEntriesHelper(appendReply.FromId, appendReplyChan, installSnapshotReplyChan)
+				// }
 			} else {
 				// if fail, follower tell leader from where to try is better,
 				// ignore the rsp if this follower is not voting to it
@@ -1410,10 +1553,10 @@ func leaderHandler(rf *Raft) {
 							rf.me, rf.MatchIndex[appendReply.FromId], rf.NextIndex[appendReply.FromId]))
 					}
 					rf.NextIndex[appendReply.FromId] = max(rf.NextIndex[appendReply.FromId], rf.MatchIndex[appendReply.FromId])
-					rf.appendEntriesHelper(appendReply.FromId, appendReplyChan, installSnapshotReplyChan)
+					rf.appendEntriesHelper(appendReply.FromId, rf.appendReplyChan, rf.installSnapshotReplyChan)
 				}
 			}
-		case installSnapshotReply := <-installSnapshotReplyChan:
+		case installSnapshotReply := <-rf.installSnapshotReplyChan:
 			DPrintf("[%v][leaderHandler] received installSnapshotReply:%+v, lastInstallshotReqly[%v]:%+v",
 				rf.me, installSnapshotReply, installSnapshotReply.FromId, lastInstallshotReqly[installSnapshotReply.FromId])
 			if lastInstallshotReqly[installSnapshotReply.FromId] != nil && lastInstallshotReqly[installSnapshotReply.FromId].TimeStamp >= installSnapshotReply.TimeStamp {
@@ -1432,17 +1575,26 @@ func leaderHandler(rf *Raft) {
 			DPrintf("[%v][leaderHandler] received ToStopChan", rf.me)
 			rf.ToStop = true
 			return
-		case <-rf.GetStateReqChan:
-			DPrintf("[%v][leaderHandler] received GetStateReqChan", rf.me)
-			rf.GetStateHelper()
+		// case <-rf.GetStateReqChan:
+		// 	DPrintf("[%v][leaderHandler] received GetStateReqChan", rf.me)
+		// 	rf.GetStateHelper()
 		case msg := <-rf.MsgChan:
 			DPrintf("[%v][leaderHandler] received msg:%+v", rf.me, msg)
 			rf.MsgHandler(msg)
-		case StartReq := <-rf.StartReqChan:
-			DPrintf("[%v][leaderHandler] received StartReq:%+v", rf.me, StartReq)
-			rf.StartHelper(StartReq)
-			// once we receive new entry, we should send out append Entry to peers immediately
-			timer = time.After(0)
+			// case StartReq := <-rf.StartReqChan:
+			// 	DPrintf("[%v][leaderHandler] received StartReq:%+v", rf.me, StartReq)
+			// 	rf.StartHelper(StartReq)
+			// 	// once we receive new entry, we should send out append Entry to peers immediately
+			// 	// timer = time.After(0)
+			// 	// for i := range rf.peers {
+			// 	// 	if i == rf.me {
+			// 	// 		lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+			// 	// 		rf.NextIndex[rf.me] = lastLogEntryIndex + 1
+			// 	// 		rf.MatchIndex[rf.me] = lastLogEntryIndex
+			// 	// 		continue
+			// 	// 	}
+			// 	// 	rf.appendEntriesHelper(i, appendReplyChan, installSnapshotReplyChan)
+			// 	// }
 		}
 		DPrintf("[%v][leaderHandler] end of for loop, rf:%+v", rf.me, rf)
 	}

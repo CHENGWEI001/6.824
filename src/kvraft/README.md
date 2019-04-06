@@ -1,9 +1,5 @@
 # TODO
-* is making below to blocking call safe?
-```
-					go func(msg SendMsg, reply *SendMsgReply) {
-```
-https://github.com/uber-go/goleak
+
 
 # Steps
 ```

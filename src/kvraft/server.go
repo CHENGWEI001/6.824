@@ -12,7 +12,7 @@ import (
 import "bytes"
 
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
-const SnapshotSizeTolerancePercentage = 5
+const SnapshotSizeTolerancePercentage = 10
 const SnapShotCheckIntervalMillisecond = 50 * time.Millisecond
 const SendMsgTaskMaxWaitLimit = 20000 * time.Millisecond
 const Debug = 0
@@ -87,6 +87,7 @@ type KVServer struct {
 type KVRaftPersistence struct {
 	LastAppliedReq map[int64]int64
 	State          map[string]string
+	LastApplyMsg   raft.ApplyMsg
 }
 
 // the worker handler to send new request msg to KV raft main thread
@@ -229,6 +230,7 @@ func (kv *KVServer) createSnapshot() {
 	e.Encode(KVRaftPersistence{
 		State:          kv.State,
 		LastAppliedReq: kv.LastAppliedReq,
+		LastApplyMsg:   *kv.LastApplyMsg,
 	})
 	data := w.Bytes()
 	kv.rf.CreateSnapshot(data, kv.LastApplyMsg)
@@ -256,9 +258,25 @@ func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
 	//kv.Unlock()
 }
 
+func (kv *KVServer) CheckRaftStateSize() {
+	DPrintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v, maxraftstate:%v\n",
+		kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
+	if kv.persister.RaftStateSize() > kv.maxraftstate {
+		panic(fmt.Sprintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v is over the limit:%v! rf:%+v\n",
+			kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, kv))
+	}
+	if (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
+		kv.createSnapshot()
+	}
+}
+
 func (kv *KVServer) StartKVThread() {
+	DPrintf("[kv:%v]start of Thread: %+v\n", kv.me, kv)
 	defer DPrintf("[kv:%v]End of Thread: %+v\n", kv.me, kv)
-	// 	snapShotCheckTimer := time.After(SnapShotCheckIntervalMillisecond)
+	var snapShotCheckTimer <-chan time.Time
+	if kv.maxraftstate > 0 {
+		snapShotCheckTimer = time.After(SnapShotCheckIntervalMillisecond)
+	}
 	for {
 		DPrintf("[kv:%v]start of for loop kv:%+v\n", kv.me, kv)
 		select {
@@ -320,6 +338,7 @@ func (kv *KVServer) StartKVThread() {
 				}
 				delete(kv.PendingQ, applyCh.CommandIndex)
 			}
+			kv.CheckRaftStateSize()
 			// 			kv.Unlock()
 			DPrintf("[kv:%v]done handling applyCh applyCh:%+v, kv:%+v\n", kv.me, applyCh, kv)
 		case msg := <-kv.AddToPendingQChan:
@@ -332,12 +351,11 @@ func (kv *KVServer) StartKVThread() {
 		case <-kv.ToStopChan:
 			DPrintf("[kv:%v]received ToStopChan\n", kv.me)
 			kv.ToStop = true
-			// 		case <-snapShotCheckTimer:
-			// 			DPrintf("[kv:%v]snapShotCheckTimer is up: RaftStateSize:%v, maxraftstate:%v\n",
-			// 				kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
-			// 			if (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
-			// 				kv.createSnapshot()
-			// 			}
+		case <-snapShotCheckTimer:
+			DPrintf("[kv:%v]snapShotCheckTimer is up: RaftStateSize:%v, maxraftstate:%v\n",
+				kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
+			kv.CheckRaftStateSize()
+			snapShotCheckTimer = time.After(SnapShotCheckIntervalMillisecond)
 		}
 		if kv.ToStop {
 			return
@@ -358,6 +376,7 @@ func (kv *KVServer) ReadSnapshot(data []byte) {
 	}
 	kv.LastAppliedReq = obj.LastAppliedReq
 	kv.State = obj.State
+	kv.LastApplyMsg = &obj.LastApplyMsg
 }
 
 //
@@ -401,6 +420,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.persister = persister
 	kv.maxraftstate = maxraftstate
 	kv.ReadSnapshot(kv.persister.ReadSnapshot())
+	kv.CreateSnapshotPending = false
+	DPrintf("[kv:%v] Make kv:%+v\n", kv.me, kv)
 
 	go kv.StartKVThread()
 	return kv
