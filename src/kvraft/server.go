@@ -12,7 +12,9 @@ import (
 import "bytes"
 
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
-const SnapshotSizeTolerancePercentage = 10
+
+// const AwaitCheckSnapshotPendingIntervalMillisecond = 5 * time.Millisecond
+const SnapshotSizeTolerancePercentage = 5
 const SnapShotCheckIntervalMillisecond = 50 * time.Millisecond
 const SendMsgTaskMaxWaitLimit = 20000 * time.Millisecond
 const Debug = 0
@@ -82,6 +84,8 @@ type KVServer struct {
 	RemoveFromPendingQChan chan *SendMsgArgs // channel for remove item from PendingQ
 	persister              *raft.Persister   // persister
 	LastApplyMsg           *raft.ApplyMsg    // the last ApplyMsg
+	CreateSnapshotPending  bool              // indicating wether any pending CreateSnapshot ongoing
+	SendMsgJobQ            []*SendMsgArgs    // SendMsg job queue , will be processed by kv main thread when it is idle
 }
 
 type KVRaftPersistence struct {
@@ -113,6 +117,11 @@ func (kv *KVServer) SendMsgTask(args *SendMsgArgs, reply *SendMsgReply) {
 				goto End
 			}
 			if !msgSent {
+				// if there is pendingSnapshot, wait until it is done
+				// for kv.PendingCreateSnapShot() {
+				// 	time.Sleep(AwaitCheckSnapshotPendingIntervalMillisecond)
+				// }
+
 				// make buffered channel to prevent dead lock for below scenario
 				// kv received sendMsg and call sendMsgToRaft, it call rf.start()
 				// when rf.start is done, it will try to send to reply chan make here
@@ -233,8 +242,28 @@ func (kv *KVServer) createSnapshot() {
 		LastApplyMsg:   *kv.LastApplyMsg,
 	})
 	data := w.Bytes()
+	kv.SetCreateSnapShot()
 	kv.rf.CreateSnapshot(data, kv.LastApplyMsg)
 	DPrintf("[kv:%v]done createSnapshot: RaftStateSize:%v, data:%+v\n", kv.me, kv.persister.RaftStateSize(), data)
+}
+
+func (kv *KVServer) SetCreateSnapShot() {
+	// 	kv.Lock()
+	kv.CreateSnapshotPending = true
+	// 	kv.Unlock()
+}
+
+func (kv *KVServer) UnsetCreateSnapShot() {
+	// 	kv.Lock()
+	kv.CreateSnapshotPending = false
+	// 	kv.Unlock()
+}
+
+func (kv *KVServer) PendingCreateSnapShot() (status bool) {
+	// 	kv.Lock()
+	status = kv.CreateSnapshotPending
+	// 	kv.Unlock()
+	return
 }
 
 func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
@@ -258,16 +287,50 @@ func (kv *KVServer) SendMsgToRaft(msg *SendMsgArgs) {
 	//kv.Unlock()
 }
 
-func (kv *KVServer) CheckRaftStateSize() {
+// return
+// true : not over the limit
+// false : close to limit, sent snapshot request to rf
+func (kv *KVServer) CheckRaftStateSize() (status bool) {
+	status = true
+	if kv.maxraftstate == -1 {
+		return
+	}
 	DPrintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v, maxraftstate:%v\n",
 		kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
-	if kv.persister.RaftStateSize() > kv.maxraftstate {
-		panic(fmt.Sprintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v is over the limit:%v! rf:%+v\n",
-			kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, kv))
-	}
-	if (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
+	// 	if kv.persister.RaftStateSize() > kv.maxraftstate {
+	// 		panic(fmt.Sprintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v is over the limit:%v! DecodeState:%+v, kv:%+v\n",
+	// 			kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, kv.rf.DecodeState(kv.persister.ReadRaftState()), kv))
+	// 	}
+	if !kv.PendingCreateSnapShot() && (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
 		kv.createSnapshot()
+		status = false
 	}
+	return
+}
+
+func (kv *KVServer) specialApplyMsgHandler(applyCh *raft.ApplyMsg) {
+	switch applyCh.Code {
+	case raft.DONE_INSTALL_SNAPSHOT:
+		kv.ReadSnapshot(kv.persister.ReadSnapshot())
+	case raft.DONE_CREATE_SNAPSHOT:
+		kv.UnsetCreateSnapShot()
+		kv.processingSendMsgJobQ()
+	case raft.TO_CHECCK_STATE_SIZE:
+		kv.CheckRaftStateSize()
+	default:
+		panic(fmt.Sprintf("[kv:%v] specialApplyMsgHandler: invalid Code:%+v! applyCh:%+v, kv:%+v\n",
+			kv.me, applyCh.Code, applyCh, kv))
+	}
+}
+
+func (kv *KVServer) processingSendMsgJobQ() {
+	DPrintf("[kv:%v] processingSendMsgJobQ: start len(kv.SendMsgJobQ):%+v\n", kv.me, len(kv.SendMsgJobQ))
+	// 	for !kv.PendingCreateSnapShot() && len(kv.SendMsgJobQ) > 0 && kv.CheckRaftStateSize() {
+	for len(kv.SendMsgJobQ) > 0 {
+		kv.SendMsgToRaft(kv.SendMsgJobQ[0])
+		kv.SendMsgJobQ = kv.SendMsgJobQ[1:]
+	}
+	DPrintf("[kv:%v] processingSendMsgJobQ: end len(kv.SendMsgJobQ):%+v\n", kv.me, len(kv.SendMsgJobQ))
 }
 
 func (kv *KVServer) StartKVThread() {
@@ -294,14 +357,16 @@ func (kv *KVServer) StartKVThread() {
 				// to raft instance and push into KV pendingQ, the purpose of pendingQ is to
 				// know which client Requst to reply once it is commited by Raft instance
 				// go kv.SendMsgToRaft(SendMsg)
-				kv.SendMsgToRaft(SendMsg)
+				// kv.SendMsgToRaft(SendMsg)
+				kv.SendMsgJobQ = append(kv.SendMsgJobQ, SendMsg)
+				kv.processingSendMsgJobQ()
 			}
 			DPrintf("[kv:%v]done handling SendMsg SendMsg:%+v, kv:%+v\n", kv.me, SendMsg, kv)
 		case applyCh := <-kv.applyCh:
 			DPrintf("[kv:%v]received applyCh: applyCh:%+v\n", kv.me, applyCh)
 			// 			kv.Lock()
 			if !applyCh.CommandValid {
-				kv.ReadSnapshot(kv.persister.ReadSnapshot())
+				kv.specialApplyMsgHandler(&applyCh)
 				continue
 			}
 			// only need to touch state when opCode is PUT, do nothing for GET
@@ -338,7 +403,7 @@ func (kv *KVServer) StartKVThread() {
 				}
 				delete(kv.PendingQ, applyCh.CommandIndex)
 			}
-			kv.CheckRaftStateSize()
+			// 			kv.CheckRaftStateSize()
 			// 			kv.Unlock()
 			DPrintf("[kv:%v]done handling applyCh applyCh:%+v, kv:%+v\n", kv.me, applyCh, kv)
 		case msg := <-kv.AddToPendingQChan:
@@ -356,6 +421,13 @@ func (kv *KVServer) StartKVThread() {
 				kv.me, kv.persister.RaftStateSize(), kv.maxraftstate)
 			kv.CheckRaftStateSize()
 			snapShotCheckTimer = time.After(SnapShotCheckIntervalMillisecond)
+			// 		default:
+			// 			// whenever we don't have pending snapshot, keep processing client request
+			// 			// but stop it whenever the Raft state is is tight
+			// 			for !kv.PendingCreateSnapShot() && len(kv.SendMsgJobQ) > 0 && kv.CheckRaftStateSize() {
+			// 				kv.SendMsgToRaft(kv.SendMsgJobQ[0])
+			// 				kv.SendMsgJobQ = kv.SendMsgJobQ[1:]
+			// 			}
 		}
 		if kv.ToStop {
 			return
@@ -420,7 +492,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.persister = persister
 	kv.maxraftstate = maxraftstate
 	kv.ReadSnapshot(kv.persister.ReadSnapshot())
-	kv.CreateSnapshotPending = false
+	kv.UnsetCreateSnapShot()
+	kv.SendMsgJobQ = make([]*SendMsgArgs, 0)
 	DPrintf("[kv:%v] Make kv:%+v\n", kv.me, kv)
 
 	go kv.StartKVThread()

@@ -1,6 +1,8 @@
 # TODO
-
-
+* TO_CHECCK_STATE_SIZE to only when new log added, not to do in every persist
+* new CODE to tell KV when step up/down from leader
+* clean up Q when step down from leader for KV
+* might need to have rf know maxRaftStateSize so follower when doing append can consider if it is going to go over the limit
 # Steps
 ```
 GOPATH=/home/ec2-user/environment/6.824/

@@ -44,7 +44,12 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Code         int // for raft to tell kv what to do for this special MSG
 }
+
+const DONE_INSTALL_SNAPSHOT = 0
+const DONE_CREATE_SNAPSHOT = 1
+const TO_CHECCK_STATE_SIZE = 2
 
 //
 // A Go object implementing a single Raft peer.
@@ -54,6 +59,7 @@ const ELECTION_TIMEOUT_MILISECONDS = 500
 const ELECTION_TIMEOUT_RAND_RANGE_MILISECONDS = 500
 const HEARTBEAT_TIMEOUT_MILISECONDS = 200
 const LEADER_PEER_TICK_MILISECONDS = 200
+const EXTERNAL_API_TIMEOUT_MILLISECONDS = 1000 * time.Millisecond
 const INITIAL_VOTED_FOR = -1
 
 type Raft struct {
@@ -169,9 +175,16 @@ func (rf *Raft) GetState() (int, bool) {
 	}
 	DPrintf("[rf:%v]start GetState: args: %+v\n", rf.me, req.args)
 	rf.MsgChan <- req
-	reply := <-req.replyChan
-	DPrintf("[rf:%v]done GetState: reply: %+v\n", rf.me, reply)
-	return reply.term, reply.isLeader
+	timer := time.After(EXTERNAL_API_TIMEOUT_MILLISECONDS)
+	select {
+	case reply := <-req.replyChan:
+		DPrintf("[rf:%v]done GetState: reply: %+v\n", rf.me, reply)
+		return reply.term, reply.isLeader
+	case <-timer:
+		DPrintf("[rf:%v] GetState timeout: req.args: %+v\n", rf.me, req.args)
+		return 0, false
+	}
+
 }
 
 //
@@ -189,16 +202,32 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 	// DPrintf("[%v][persist] : to save to persist rf:%+v\n", rf.me, rf)
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(RaftPersistence{
-		CurrentTerm: rf.CurrentTerm,
-		VotedFor:    rf.VotedFor,
-		Log:         rf.Log,
-	})
-	data := w.Bytes()
+	data := rf.EncodeState()
 	rf.persister.SaveRaftState(data)
+
+	rf.SelfWorkerChan <- &ApplyMsg{
+		CommandValid: false,
+		Code:         TO_CHECCK_STATE_SIZE,
+	}
+	// DPrintf("[%v][persist] done RaftStateSize:%+v, DecodeState:%+v\n",
+	// 	rf.me, rf.persister.RaftStateSize())
+	DPrintf("[%v][persist] done RaftStateSize:%+v, DecodeState:%+v\n",
+		rf.me, rf.persister.RaftStateSize(),
+		rf.DecodeState(rf.persister.ReadRaftState()))
 	// DPrintf("[%v][persist] : done save to persist rf:%+v\n", rf.me, rf)
+}
+
+func (rf *Raft) DecodeState(data []byte) *RaftPersistence {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	// var term int
+	// var votedFor int
+	// var rfLog []LogEntry
+	var obj RaftPersistence
+	if d.Decode(&obj) != nil {
+		panic(fmt.Sprintf("[%v][DecodeState] fail to read Persist!\n", rf.me))
+	}
+	return &obj
 }
 
 //
@@ -234,6 +263,9 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.CurrentTerm = obj.CurrentTerm
 	rf.VotedFor = obj.VotedFor
 	rf.Log = obj.Log
+	rf.SnapshotLastIndex = obj.SnapshotLastIndex
+	rf.SnapshotLastTerm = obj.SnapshotLastTerm
+	rf.CommitIndex = max(rf.SnapshotLastIndex, 0)
 	// DPrintf("[%v][readPersist] : read from persist rf:%+v\n", rf.me, rf)
 }
 
@@ -423,9 +455,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	DPrintf("[rf:%v]start Start: args: %+v\n", rf.me, req.args)
 	rf.MsgChan <- req
-	reply := <-req.replyChan
-	DPrintf("[rf:%v]done Start: req: %+v, reply: %+v\n", rf.me, req, reply)
-	return reply.index, reply.term, reply.isLeader
+	timer := time.After(EXTERNAL_API_TIMEOUT_MILLISECONDS)
+	select {
+	case reply := <-req.replyChan:
+		DPrintf("[rf:%v]done Start: req: %+v, reply: %+v\n", rf.me, req, reply)
+		return reply.index, reply.term, reply.isLeader
+	case <-timer:
+		DPrintf("[rf:%v]Start timeout: req: %+v\n", rf.me, req)
+		return 0, 0, false
+	}
 }
 
 //
@@ -495,6 +533,8 @@ func (rf *Raft) StartHelper(req *StartReuqest) {
 		term:     rf.CurrentTerm,
 		isLeader: rf.CurrentRaftState == leader,
 	}
+	// since we add new entry to log, need to save to persist
+	rf.persist()
 }
 
 func (rf *Raft) getLastLogEntryInfo() (index int, term int) {
@@ -513,6 +553,11 @@ func (rf *Raft) getLastLogEntryInfo() (index int, term int) {
 
 func (rf *Raft) getLogEntryIndexFromGlobalIndex(globalIndex int) (logEntryIndex int) {
 	logEntryIndex = globalIndex - rf.SnapshotLastIndex - 1
+	return
+}
+
+func (rf *Raft) getGlobalIndexFromLogEntryIndex(logEntryIndex int) (globalIndex int) {
+	globalIndex = logEntryIndex + rf.SnapshotLastIndex + 1
 	return
 }
 
@@ -555,24 +600,33 @@ func (rf *Raft) createSnapshotHelper(req *CreateSnapshotReq) {
 		panic(fmt.Sprintf("[rf:%v][createSnapshotHelper] req.lastApplyMsg is nil! req:%+v, rf:%+v\n",
 			rf.me, req, rf))
 	}
-	DPrintf("[rf:%v] createSnapshotHelper: to handle CreateSnapshotReq:%+v, lastApplyMsg:%+v\n",
-		rf.me, req, req.lastApplyMsg)
+	DPrintf("[rf:%v] createSnapshotHelper: to handle CreateSnapshotReq:%+v, lastApplyMsg:%+v, RaftStateSize:%+v\n",
+		rf.me, req, req.lastApplyMsg, rf.persister.RaftStateSize())
 	localCutOffIndex := rf.getLogEntryIndexFromGlobalIndex(req.lastApplyMsg.CommandIndex)
-	if localCutOffIndex < 0 || localCutOffIndex >= len(rf.Log) {
-		panic(fmt.Sprintf("[rf:%v][createSnapshotHelper] invalid index for log:%v, rf:%+v\n",
-			rf.me, localCutOffIndex, rf))
+	// because for follower createSnapshot and installSnapshot migth be conflict with each other
+	// so when ever recieve createSnapshot with index lower than lastSnapshot index, skip saving
+	// and reply to kv directly
+	if localCutOffIndex >= 0 {
+		if localCutOffIndex < 0 || localCutOffIndex >= len(rf.Log) {
+			panic(fmt.Sprintf("[rf:%v][createSnapshotHelper] invalid index for log:%v, rf:%+v\n",
+				rf.me, localCutOffIndex, rf))
+		}
+		rf.SnapshotLastTerm = rf.Log[localCutOffIndex].Term
+		rf.SnapshotLastIndex = req.lastApplyMsg.CommandIndex
+		// cut off older log which is included in snapshot
+		rf.Log = rf.Log[localCutOffIndex+1:]
+
+		state := rf.EncodeState()
+		// save both rf state and kv state into persist snapshot
+		rf.persister.SaveStateAndSnapshot(state, req.kvState)
 	}
-	rf.SnapshotLastTerm = rf.Log[localCutOffIndex].Term
-	rf.SnapshotLastIndex = req.lastApplyMsg.CommandIndex
-	// cut off older log which is included in snapshot
-	rf.Log = rf.Log[localCutOffIndex+1:]
-
-	state := rf.EncodeState()
-	// save both rf state and kv state into persist snapshot
-	rf.persister.SaveStateAndSnapshot(state, req.kvState)
-
-	DPrintf("[rf:%v] createSnapshotHelper: done handle CreateSnapshotReq: rf%+v\n",
-		rf.me, rf)
+	// ask self worker to send applymsg to tell KV snapshot is done
+	rf.SelfWorkerChan <- &ApplyMsg{
+		CommandValid: false,
+		Code:         DONE_CREATE_SNAPSHOT,
+	}
+	DPrintf("[rf:%v] createSnapshotHelper: done handle CreateSnapshotReq: RaftStateSize:%+v, rf%+v\n",
+		rf.me, rf.persister.RaftStateSize(), rf)
 }
 
 func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
@@ -589,6 +643,11 @@ func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
 			panic(fmt.Sprintf("[%v][InstallSnapshotHelper] not expect go to this point under state:%v, rf:%+v",
 				rf.me, rf.CurrentRaftState, rf))
 		}
+		// if recieved install snapshot request with snapshot included index smaller than itself
+		// snapshotLastIndex, we probably could just ignore it
+		if req.args.LastIncludedIndex < rf.SnapshotLastIndex {
+			return
+		}
 		// localCutOffIndex >= len(rf.Log) would be the case where follower is lagging behind
 		localCutOffIndex := min(rf.getLogEntryIndexFromGlobalIndex(req.args.LastIncludedIndex), len(rf.Log)-1)
 		rf.SnapshotLastIndex = req.args.LastIncludedIndex
@@ -604,7 +663,8 @@ func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
 		rf.persister.SaveStateAndSnapshot(state, req.args.Data)
 		// ask self worker to send applymsg with update data from snapshot to KV peer
 		rf.SelfWorkerChan <- &ApplyMsg{
-			CommandValid: false, // send to false would mean KV to load snapshot
+			CommandValid: false,
+			Code:         DONE_INSTALL_SNAPSHOT,
 		}
 	}
 }
@@ -794,7 +854,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.LastAppendEntrySentTime = make([]time.Time, len(peers))
 	rf.SnapshotLastIndex = -1
 	rf.SnapshotLastTerm = 0
-	rf.MsgChan = make(chan interface{})
+	rf.MsgChan = make(chan interface{}, 8192)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -971,7 +1031,7 @@ func startRaftThread(rf *Raft) {
 		}
 		if rf.ToStop {
 			rf.stopSelfWorker()
-			rf.MsgFlusher()
+			// rf.MsgFlusher()
 			return
 		}
 	}
@@ -1009,6 +1069,8 @@ func (rf *Raft) sendApplyMsg(start int, end int) {
 	if start > end {
 		return
 	}
+	DPrintf("[%v][sendApplyMsg] to sendApplyMsg: start:%v, end:%v\n",
+		rf.me, start, end)
 	for i := start; i <= end; i++ {
 		if rf.Log[i].Index != i+rf.SnapshotLastIndex+1 {
 			panic(fmt.Sprintf("[%v][sendApplyMsg] rf.Log[%v].Index:%v != i:%v rf:%+v", rf.me, i, rf.Log[i].Index, i, rf))
@@ -1028,14 +1090,22 @@ func (rf *Raft) sendApplyMsg(start int, end int) {
 		// }(msg, rf.PrevApplyMsgToken, rf.NextApplyMsgToken)
 		// rf.PrevApplyMsgToken, rf.NextApplyMsgToken = rf.NextApplyMsgToken, make(chan int64)
 		rf.SelfWorkerChan <- &msg
+		DPrintf("[%v][sendApplyMsg] sent msg: msg:%+v\n",
+			rf.me, msg)
 	}
 	// update LastApplied after we apply to state machine
 	rf.LastApplied = end
+	DPrintf("[%v][sendApplyMsg] to sendApplyMsg: start:%v, end:%v\n",
+		rf.me, start, end)
 }
 
 func (rf *Raft) followerAppendLogEntry(reqAppend *AppendEntriesArgs, rspAppend *AppendEntriesReply) {
 	// refer to https://stackoverflow.com/questions/16248241/concatenate-two-slices-in-go
-	rf.Log = append(rf.Log[:rf.getLogEntryIndexFromGlobalIndex(reqAppend.PrevLogIndex)+1], reqAppend.Entries...)
+	if reqAppend.PrevLogIndex >= rf.SnapshotLastIndex {
+		rf.Log = append(rf.Log[:rf.getLogEntryIndexFromGlobalIndex(reqAppend.PrevLogIndex)+1], reqAppend.Entries...)
+	} else {
+		rf.Log = reqAppend.Entries[min(rf.SnapshotLastIndex-reqAppend.PrevLogIndex, len(reqAppend.Entries)):]
+	}
 	lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
 	if reqAppend.LeaderCommit > rf.CommitIndex {
 		oldCommitIndex := rf.CommitIndex
@@ -1060,7 +1130,7 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 	// what if leaderId != rf.VotedFor, but term the same , should reject and check it ?
 	if reqAppend.Term >= rf.CurrentTerm && reqAppend.LeadId == rf.VotedFor {
 		if *lastAppendEntryReq != nil && (*lastAppendEntryReq).TimeStamp >= reqAppend.TimeStamp {
-			DPrintf("[%v][followerHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, **lastAppendEntryReq)
+			DPrintf("[%v][followerAppendEntryHandler] received older reqAppend:%+v, lastAppendEntryReq:%+v", rf.me, reqAppend, **lastAppendEntryReq)
 			rspAppend.IsValid = false
 			rf.AppendEntriesReplyChan <- rspAppend
 			// do I need to reset election timer here? but since it is older request, I think we should not reset it
@@ -1072,11 +1142,9 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 		// 1) if reqAppend.PrevLogIndex == rf.SnapshotLastIndex, it should
 		//    have same term, if not panic, otherwise append entry and
 		//    return success
-		// 2) else if lastLogEntryIndex == rf.SnapshotLastIndex, this would mean
-		//    we don't have any thing in log, can't compare further, reply leader
-		//    nextIndex = snapshotLastIndex + 1, and next time leader would give
-		//    "reqAppend.PrevLogIndex == rf.SnapshotLastIndex" which would fall
-		//    in case(1)
+		// 2) else if reqAppend.PrevLogIndex < rf.SnapshotLastIndex, that would
+		//    means prev index is included in snapshot, so follower just take over
+		//    the log entry after snapshotlast index
 		// 3) else if localPrevLogIndex within rf.Log range and term are the
 		//    same, return success
 		// 4) for the rest of case, first get the min(localPrevLogIndex, localLastIndex)
@@ -1092,36 +1160,40 @@ func (rf *Raft) followerAppendEntryHandler(reqAppend *AppendEntriesArgs, rspAppe
 			// 	rf.me, rf))
 			// case(1)
 			if rf.SnapshotLastTerm != reqAppend.PrevLogTerm {
-				panic(fmt.Sprintf("[%v][followerHandler] snapshot (index:%v, term:%v) term != reqAppend.PrevLogTerm:%v, rf:%+v\n",
+				panic(fmt.Sprintf("[%v][followerAppendEntryHandler] snapshot (index:%v, term:%v) term != reqAppend.PrevLogTerm:%v, rf:%+v\n",
 					rf.me, rf.SnapshotLastIndex, rf.SnapshotLastTerm, reqAppend.PrevLogTerm, rf))
 			}
 			rf.followerAppendLogEntry(reqAppend, rspAppend)
-		} else if lastLogEntryIndex == rf.SnapshotLastIndex {
+			// } else if lastLogEntryIndex == rf.SnapshotLastIndex {
+		} else if reqAppend.PrevLogIndex < rf.SnapshotLastIndex {
 			// panic(fmt.Sprintf("[%v][followerHandler] shouldn't go into case(2) yet rf:%+v\n",
 			// 	rf.me, rf))
 			// case(2)
-			rspAppend.NextIndex = rf.SnapshotLastIndex + 1
+			// rspAppend.NextIndex = rf.SnapshotLastIndex + 1
+			rf.followerAppendLogEntry(reqAppend, rspAppend)
+
 		} else if localAppendEntryPrevLogIndex >= 0 && localAppendEntryPrevLogIndex < len(rf.Log) && rf.Log[localAppendEntryPrevLogIndex].Term == reqAppend.PrevLogTerm {
 			// case(3)
 			rf.followerAppendLogEntry(reqAppend, rspAppend)
 		} else {
 			// case(4)
 			localCheckIndex := min(localAppendEntryPrevLogIndex, localLastLogEntryIndex)
-			if localCheckIndex < 0 || localCheckIndex >= len(rf.Log) {
-				panic(fmt.Sprintf("[%v][followerHandler] localCheckIndex:%v is out of bound, len(rf.Log):%v, rf:%+v\n",
+			if localCheckIndex < -1 || localCheckIndex >= len(rf.Log) {
+				panic(fmt.Sprintf("[%v][followerAppendEntryHandler] localCheckIndex:%v is out of bound, len(rf.Log):%v, rf:%+v\n",
 					rf.me, localCheckIndex, len(rf.Log), rf))
 			}
 			// if we have conflict term, search for first index that has leader prevLogTerm
 			// this rule is per https://pdos.csail.mit.edu/6.824/notes/l-raft2.txt
-			if reqAppend.PrevLogTerm != rf.Log[localCheckIndex].Term {
+			if localCheckIndex >= 0 && reqAppend.PrevLogTerm != rf.Log[localCheckIndex].Term {
 				rspAppend.ConflictTerm = rf.Log[localCheckIndex].Term
 				// try to find first index of conflict term
-				rspAppend.ConflictTermFirstIndex = rf.binarySearchForTerm(rf.Log, 0, localCheckIndex, rspAppend.ConflictTerm, true)
-				if rspAppend.ConflictTermFirstIndex == -1 {
-					panic(fmt.Sprintf("[%v][followerHandler] can't find conflict term:%v in its log(%v,%v) in rf:%+v", rf.me, rspAppend.ConflictTerm, 0, localCheckIndex, rf))
+				localConflictTermFirstIndex := rf.binarySearchForTerm(rf.Log, 0, localCheckIndex, rspAppend.ConflictTerm, true)
+				if localConflictTermFirstIndex == -1 {
+					panic(fmt.Sprintf("[%v][followerAppendEntryHandler] can't find conflict term:%v in its log(%v,%v) in rf:%+v", rf.me, rspAppend.ConflictTerm, 0, localCheckIndex, rf))
 				}
+				rspAppend.ConflictTermFirstIndex = rf.getGlobalIndexFromLogEntryIndex(localConflictTermFirstIndex)
 			}
-			rspAppend.NextIndex = localCheckIndex + 1 + rf.SnapshotLastIndex + 1
+			rspAppend.NextIndex = rf.getGlobalIndexFromLogEntryIndex(localCheckIndex + 1)
 		}
 	}
 	rspAppend.Term = rf.CurrentTerm
@@ -1348,6 +1420,9 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 	// 	return
 	// }
 
+	DPrintf("[%v][appendEntriesHelper] destServer:%v, prevLogIndex:%v, prevLogTerm:%v\n",
+		rf.me, destServer, prevLogIndex, prevLogTerm)
+
 	// startIndexForNextLogEntries < 0 would mean current log doesn't have the entry,
 	// we need to install snapshot
 	if prevLogIndex < 0 {
@@ -1368,7 +1443,7 @@ func (rf *Raft) appendEntriesHelper(destServer int, appendReplyChan chan *Append
 			replyChan: installSnapReplyChan,
 		}
 		rf.NextIndex[destServer] = rf.SnapshotLastIndex + 1
-		rf.MatchIndex[destServer] = rf.SnapshotLastIndex
+		// rf.MatchIndex[destServer] = rf.SnapshotLastIndex
 	} else {
 		// if startIndexForNextLogEntries-1 < 0 || startIndexForNextLogEntries-1 >= len(rf.Log) {
 		// 	panic(fmt.Sprintf("[%v][appendEntriesHelper] (startIndexForNextLogEntries-1):%v is out of bound, destServer:%v, rf:%+v",
@@ -1522,7 +1597,7 @@ func leaderHandler(rf *Raft) {
 				rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
 				rf.MatchIndex[appendReply.FromId] = appendReply.NextIndex - 1
 				rf.updateLeaderCommitIndex()
-				rf.persist()
+				// rf.persist()
 				// even we receive success, if we have more item for the follower
 				// need to send to them
 				// lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
@@ -1538,9 +1613,12 @@ func leaderHandler(rf *Raft) {
 					// but the one differene is that, I choose to use if Leader has the conflict term entry,
 					// which means we can use that entry as prevIdex, so set nextIndex to that found conflict entry index + 1
 					if appendReply.ConflictTerm != -1 {
-						lastConflictTermEntryIndex := rf.binarySearchForTerm(rf.Log, 0, len(rf.Log)-1, appendReply.ConflictTerm, false)
-						if lastConflictTermEntryIndex != -1 {
-							rf.NextIndex[appendReply.FromId] = lastConflictTermEntryIndex + 1
+						localLastConflictTermEntryIndex := -1
+						if len(rf.Log) > 0 {
+							localLastConflictTermEntryIndex = rf.binarySearchForTerm(rf.Log, 0, len(rf.Log)-1, appendReply.ConflictTerm, false)
+						}
+						if localLastConflictTermEntryIndex != -1 {
+							rf.NextIndex[appendReply.FromId] = rf.getGlobalIndexFromLogEntryIndex(localLastConflictTermEntryIndex + 1)
 						} else {
 							rf.NextIndex[appendReply.FromId] = appendReply.ConflictTermFirstIndex
 						}
