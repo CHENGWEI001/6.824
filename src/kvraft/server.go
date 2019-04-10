@@ -16,7 +16,7 @@ const AwaitLeaderCheckInterval = 10 * time.Millisecond
 // const AwaitCheckSnapshotPendingIntervalMillisecond = 5 * time.Millisecond
 const SnapshotSizeTolerancePercentage = 5
 const SnapShotCheckIntervalMillisecond = 50 * time.Millisecond
-const SendMsgTaskMaxWaitLimit = 20000 * time.Millisecond
+const SendMsgTaskMaxWaitLimit = 50000 * time.Millisecond
 const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -301,7 +301,9 @@ func (kv *KVServer) CheckRaftStateSize() (status bool) {
 	// 		panic(fmt.Sprintf("[kv:%v] CheckRaftStateSize: RaftStateSize:%v is over the limit:%v! DecodeState:%+v, kv:%+v\n",
 	// 			kv.me, kv.persister.RaftStateSize(), kv.maxraftstate, kv.rf.DecodeState(kv.persister.ReadRaftState()), kv))
 	// 	}
-	if !kv.PendingCreateSnapShot() && (kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage {
+	if !kv.PendingCreateSnapShot() &&
+		(kv.maxraftstate-kv.persister.RaftStateSize())*100/kv.maxraftstate < SnapshotSizeTolerancePercentage &&
+		kv.LastApplyMsg != nil {
 		kv.createSnapshot()
 		status = false
 	}

@@ -645,7 +645,7 @@ func (rf *Raft) InstallSnapshotHelper(req *InstallSnapshotReq) {
 		}
 		// if recieved install snapshot request with snapshot included index smaller than itself
 		// snapshotLastIndex, we probably could just ignore it
-		if req.args.LastIncludedIndex < rf.SnapshotLastIndex {
+		if req.args.LastIncludedIndex <= rf.CommitIndex {
 			return
 		}
 		// localCutOffIndex >= len(rf.Log) would be the case where follower is lagging behind
@@ -1107,6 +1107,8 @@ func (rf *Raft) followerAppendLogEntry(reqAppend *AppendEntriesArgs, rspAppend *
 		rf.Log = reqAppend.Entries[min(rf.SnapshotLastIndex-reqAppend.PrevLogIndex, len(reqAppend.Entries)):]
 	}
 	lastLogEntryIndex, _ := rf.getLastLogEntryInfo()
+	DPrintf("[%v][followerAppendLogEntry] lastLogEntryIndex:%v, reqAppend.LeaderCommit:%v, rf.CommitIndex:%v\n",
+		rf.me, lastLogEntryIndex, reqAppend.LeaderCommit, rf.CommitIndex)
 	if reqAppend.LeaderCommit > rf.CommitIndex {
 		oldCommitIndex := rf.CommitIndex
 		rf.CommitIndex = min(reqAppend.LeaderCommit, lastLogEntryIndex)
