@@ -74,7 +74,7 @@ func (ck *Clerk) Get(key string) string {
 		ok = ck.servers[i].Call("KVServer.Get", &args, &reply)
 		if ok && !reply.WrongLeader {
 			if reply.ClientId != args.ClientId || reply.ReqId != args.ReqId {
-				panic(fmt.Sprintf("[CK:%v][Get] args and reply data not matching!\n", ck.Uuid, args, reply))
+				panic(fmt.Sprintf("[CK:%v][Get] args:%+v and reply:%+v data not matching!\n", ck.Uuid, args, reply))
 			}
 			ck.lastLeader = i
 			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
@@ -117,7 +117,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if ok && !reply.WrongLeader {
 			DPrintf("[CK:%v][PutAppend]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
 			if reply.ClientId != args.ClientId || reply.ReqId != args.ReqId {
-				panic(fmt.Sprintf("[CK:%v][PutAppend] args and reply data not matching!\n", ck.Uuid, args, reply))
+				panic(fmt.Sprintf("[CK:%v][PutAppend] args:%+v and reply:%+v data not matching!\n", ck.Uuid, args, reply))
 			}
 			ck.lastLeader = i
 			DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, i, ok, reply)
