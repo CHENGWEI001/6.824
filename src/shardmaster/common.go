@@ -28,6 +28,18 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (cfg *Config) Clone() Config {
+	newConfig := Config{
+		Num:    cfg.Num,
+		Shards: cfg.Shards,
+		Groups: make(map[int][]string),
+	}
+	for gid, servers := range cfg.Groups {
+		newConfig.Groups[gid] = servers // here is due to we probably won't change servers slice content going forward
+	}
+	return newConfig
+}
+
 const (
 	OK = "OK"
 )
@@ -35,39 +47,55 @@ const (
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers  map[int][]string // new GID -> servers mappings
+	ReqId    int64
+	ClientId int64
 }
 
 type JoinReply struct {
 	WrongLeader bool
 	Err         Err
+	ReqId       int64
+	ClientId    int64
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs     []int
+	ReqId    int64
+	ClientId int64
 }
 
 type LeaveReply struct {
 	WrongLeader bool
 	Err         Err
+	ReqId       int64
+	ClientId    int64
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard    int
+	GID      int
+	ReqId    int64
+	ClientId int64
 }
 
 type MoveReply struct {
 	WrongLeader bool
 	Err         Err
+	ReqId       int64
+	ClientId    int64
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num      int // desired config number
+	ReqId    int64
+	ClientId int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+	ReqId       int64
+	ClientId    int64
 }
