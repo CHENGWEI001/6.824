@@ -65,7 +65,19 @@ const (
 	QUERY        = "QUERY"
 )
 
-const Debug = 1
+const Debug = 0
+const LogMasterOnly = true
+
+func smInfo(format string, sm *ShardMaster, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		// if _, isLeader := sm.rf.GetState(); LogMasterOnly && !isLeader {
+		// 	return
+		// }
+		args := append([]interface{}{sm.me, len(sm.configs)}, a...)
+		log.Printf("[INFO] Shard Master: [Id: %d, %d configs] "+format, args...)
+	}
+	return
+}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -89,6 +101,7 @@ type Op struct {
 func (sm *ShardMaster) sendMsgTask(args *SendMsgArgs, reply *SendMsgReply) {
 	startAt := time.Now().UnixNano()
 	DPrintf("[sm:%v]start SendMsgTask: startAt:%+v, args%+v\n", sm.me, startAt, args)
+	defer DPrintf("[sm:%v]done SendMsgTask: startAt:%+v, args%+v\n", sm.me, startAt, reply)
 	timer := time.After(0)
 	// 	timeOutTimer := time.After(SendMsgTaskMaxWaitLimit)
 	msgSent := false
@@ -239,6 +252,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		reply.ClientId = r.ClientId
 		reply.Err = r.Err
 	}
+	DPrintf("[sm:%v][Query]: at 255\n", sm.me, reply)
 }
 
 //
@@ -463,10 +477,29 @@ func (sm *ShardMaster) startSmThread() {
 	DPrintf("[sm:%v]start of Thread: %+v\n", sm.me, sm)
 	defer DPrintf("[sm:%v]End of Thread: %+v\n", sm.me, sm)
 	for {
-		DPrintf("[sm:%v]start of for loop sm:%+v\n", sm.me, sm)
+		// DPrintf("[sm:%v]start of for loop sm:%+v\n", sm.me, sm)
 		select {
 		case SendMsg := <-sm.sendMsgChan:
 			DPrintf("[sm:%v] received SendMsg: SendMsg:%+v\n", sm.me, SendMsg)
+			// if this is QUERY and config num is not asking for latest , since
+			// config slice content never get changed for older config, it would be
+			// okay to just return instead of putting into log, it would be treat like
+			// cache
+			if SendMsg.Command.Oc == QUERY {
+				args := SendMsg.Command.Args.(QueryArgs)
+				if args.Num != -1 && args.Num < len(sm.configs) {
+					SendMsg.ResChan <- &SendMsgResult{
+						Valid: true,
+						Reply: QueryReply{
+							WrongLeader: false,
+							ReqId:       args.ReqId,
+							ClientId:    args.ClientId,
+							Config:      sm.configs[args.Num],
+						},
+					}
+					continue
+				}
+			}
 			// since each request from client is sending serialize(it must complete one before send the next one for the same client)
 			// it is okay to check lastReq only to see new rquest is the same as last ReqId or not
 			if lastReqOp, ok := sm.lastAppliedReq[SendMsg.Command.ClientId]; ok && lastReqOp.ReqId == SendMsg.Command.ReqId {
@@ -483,7 +516,8 @@ func (sm *ShardMaster) startSmThread() {
 			}
 			DPrintf("[sm:%v]done handling SendMsg SendMsg:%+v, sm:%+v\n", sm.me, SendMsg, sm)
 		case applyCh := <-sm.applyCh:
-			DPrintf("[sm:%v]received applyCh: applyCh:%+v\n", sm.me, applyCh)
+			smInfo("start handling applyCh applyCh:%+v, sm.PendingQ:%+v\n", sm, applyCh, sm.pendingQ)
+			// DPrintf("[sm:%v]received applyCh: applyCh:%+v\n", sm.me, applyCh)
 			if !applyCh.CommandValid {
 				continue
 			}
@@ -509,7 +543,8 @@ func (sm *ShardMaster) startSmThread() {
 				}
 				delete(sm.pendingQ, applyCh.CommandIndex)
 			}
-			DPrintf("[sm:%v]done handling applyCh applyCh:%+v, sm:%+v\n", sm.me, applyCh, sm)
+			smInfo("done handling applyCh applyCh:%+v, sm.PendingQ:%+v\n", sm, applyCh, sm.pendingQ)
+			// DPrintf("[sm:%v]done handling applyCh applyCh:%+v, sm:%+v\n", sm.me, applyCh, sm)
 		case <-sm.toStopChan:
 			DPrintf("[sm:%v]received ToStopChan\n", sm.me)
 			sm.toStop = true
@@ -517,7 +552,7 @@ func (sm *ShardMaster) startSmThread() {
 		if sm.toStop {
 			return
 		}
-		DPrintf("[sm:%v]end of for loop sm:%+v\n", sm.me, sm)
+		// DPrintf("[sm:%v]end of for loop sm:%+v\n", sm.me, sm)
 	}
 }
 

@@ -11,6 +11,7 @@ import "math/big"
 import "fmt"
 
 const CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT = 20000 * time.Millisecond
+const TO_PANIC_IF_CLIENT_REQUEST_OVER_LIMIT = false
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -38,10 +39,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 func (ck *Clerk) Query(num int) Config {
 	startAt := time.Now()
-	DPrintf("[smck:%v][Query]: num:%+v, startAt:%+v\n", ck.Uuid, num, startAt)
+	reqId := nrand()
+	DPrintf("[smck:%v][Query]: num:%+v, startAt:%+v, reqId:%+v\n", ck.Uuid, num, startAt, reqId)
 	args := QueryArgs{
 		Num:      num,
-		ReqId:    nrand(),
+		ReqId:    reqId,
 		ClientId: ck.Uuid,
 	}
 	for {
@@ -59,8 +61,11 @@ func (ck *Clerk) Query(num int) Config {
 		}
 		time.Sleep(100 * time.Millisecond)
 		if time.Now().Sub(startAt) > CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT {
-			panic(fmt.Sprintf("[smck:%v][Query]: args:%v, startAt:%+v not complete in %+v, now:%+v\n",
-				ck.Uuid, args, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT, time.Now()))
+			if TO_PANIC_IF_CLIENT_REQUEST_OVER_LIMIT {
+				panic(fmt.Sprintf("[smck:%v][Query]: args:%+v, startAt:%+v not complete in %+v, now:%+v\n",
+					ck.Uuid, args, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT, time.Now()))
+			}
+			return Config{}
 		}
 	}
 }

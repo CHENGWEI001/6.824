@@ -1628,10 +1628,10 @@ func leaderHandler(rf *Raft) {
 						rf.NextIndex[appendReply.FromId] = appendReply.NextIndex
 					}
 					// make sure NextIndex should always bigger than current MatchIndex
-					if rf.NextIndex[appendReply.FromId] < rf.MatchIndex[appendReply.FromId] {
-						panic(fmt.Sprintf("[%v][leaderHandler] MatchIdex:%v is higher than NextIndex:%v, it is unexpected!",
-							rf.me, rf.MatchIndex[appendReply.FromId], rf.NextIndex[appendReply.FromId]))
-					}
+					// if rf.NextIndex[appendReply.FromId] < rf.MatchIndex[appendReply.FromId] {
+					// 	panic(fmt.Sprintf("[%v][leaderHandler] MatchIdex:%v is higher than NextIndex:%v, it is unexpected!, lastAppendReqly[%v]:%+v, rf:%+v",
+					// 		rf.me, rf.MatchIndex[appendReply.FromId], rf.NextIndex[appendReply.FromId], appendReply.FromId, lastAppendReqly[appendReply.FromId], rf))
+					// }
 					rf.NextIndex[appendReply.FromId] = max(rf.NextIndex[appendReply.FromId], rf.MatchIndex[appendReply.FromId])
 					rf.appendEntriesHelper(appendReply.FromId, rf.appendReplyChan, rf.installSnapshotReplyChan)
 				}

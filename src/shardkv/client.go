@@ -13,6 +13,11 @@ import "crypto/rand"
 import "math/big"
 import "shardmaster"
 import "time"
+import "fmt"
+
+// import "strconv"
+
+const CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT = 20000 * time.Millisecond
 
 //
 // which shard is a key in?
@@ -40,6 +45,7 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	Uuid int64
 }
 
 //
@@ -56,6 +62,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.Uuid = nrand()
+	DPrintf("[CK:%v][MakeClerk]: ck:%+v\n", ck.Uuid, ck)
 	return ck
 }
 
@@ -66,8 +74,13 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	startAt := time.Now()
+	DPrintf("[CK:%v][Get]: key:%v, startAt:%+v\n", ck.Uuid, key, startAt)
+	args := GetArgs{
+		Key:      key,
+		ReqId:    nrand(),
+		ClientId: ck.Uuid,
+	}
 
 	for {
 		shard := key2shard(key)
@@ -78,15 +91,31 @@ func (ck *Clerk) Get(key string) string {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+				if ok {
+					if !reply.WrongLeader && (reply.ClientId != args.ClientId || reply.ReqId != args.ReqId) {
+						panic(fmt.Sprintf("[CK:%v][Get] args:%+v and reply:%+v data not matching!\n", ck.Uuid, args, reply))
+					}
+					DPrintf("[CK:%v][Get]: <-%v ok:%v, reply:%+v\n", ck.Uuid, si, ok, reply)
+				}
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					// si = 0
+					// gid, _ = strconv.Atoi(reply.Value)
+					// servers, ok = ck.config.Groups[gid]
+					// if !ok {
+					// 	break
+					// }
 					break
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		if time.Now().Sub(startAt) > CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT {
+			panic(fmt.Sprintf("[CK:%v][Get]: key:%v, args:%+v, startAt:%+v not complete in %+v milliseconds, now:%+v\n",
+				ck.Uuid, key, args, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT, time.Now()))
+		}
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
@@ -99,11 +128,16 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	startAt := time.Now()
+	DPrintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v, startAt:%+v\n", ck.Uuid, key, value, op, startAt)
 
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ReqId:    nrand(),
+		ClientId: ck.Uuid,
+	}
 
 	for {
 		shard := key2shard(key)
@@ -113,15 +147,31 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				if ok {
+					if !reply.WrongLeader && (reply.ClientId != args.ClientId || reply.ReqId != args.ReqId) {
+						panic(fmt.Sprintf("[CK:%v][PutAppend] args:%+v and reply:%+v data not matching!\n", ck.Uuid, args, reply))
+					}
+					DPrintf("[CK:%v][PutAppend]: <-%v ok:%v, reply:%+v\n", ck.Uuid, si, ok, reply)
+				}
 				if ok && reply.WrongLeader == false && reply.Err == OK {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					// si = 0
+					// gid, _ = strconv.Atoi(reply.Value)
+					// servers, ok = ck.config.Groups[gid]
+					// if !ok {
+					// 	break
+					// }
 					break
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
+		if time.Now().Sub(startAt) > CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT {
+			panic(fmt.Sprintf("[CK:%v][PutAppend]: Beginning key:%v, value:%+v, op:%v, args:%+v, startAt:%+v not complete in %+v milliseconds, now:%+v\n",
+				ck.Uuid, key, value, op, args, startAt, CLIENT_REQUEST_NO_RESPONSE_MAX_LIMIT, time.Now()))
+		}
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
